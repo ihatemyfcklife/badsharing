@@ -60,11 +60,12 @@ func NewReceiver(meta *FileMetadata, w io.Writer, cfg SessionConfig) (*Receiver,
 	}
 
 	r := &Receiver{
-		meta:     meta,
-		writer:   w,
-		aead:     aead,
-		hasher:   sha256.New(),
-		plainBuf: make([]byte, badcrypt.DefaultPlaintextFrameSize),
+		meta:      meta,
+		writer:    w,
+		aead:      aead,
+		hasher:    sha256.New(),
+		plainBuf:  make([]byte, badcrypt.DefaultPlaintextFrameSize),
+		completed: meta.Size == 0,
 	}
 
 	// 1. Resequencer delivers packets strictly monotonically (0, 1, 2, ...) to writer
@@ -227,6 +228,8 @@ func (r *Receiver) Progress() (bytesReceived, totalBytes uint64, percent float64
 		if pct > 100.0 {
 			pct = 100.0
 		}
+	} else if r.completed {
+		pct = 100.0
 	}
 	return r.bytesWritten, r.meta.Size, pct
 }

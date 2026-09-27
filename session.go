@@ -8,7 +8,11 @@ import (
 	"io"
 
 	"github.com/ihatemyfcklife/badcrypt"
+	"golang.org/x/crypto/pbkdf2"
 )
+
+// kdfSalt is the cryptographic domain separation salt for PBKDF2 key stretching.
+var kdfSalt = []byte("badsharing-passphrase-salt-v1")
 
 const (
 	// DefaultWindowSize is the default sliding window convolution depth in badrlnc.
@@ -35,9 +39,13 @@ func GenerateRandomKey() ([32]byte, error) {
 	return key, nil
 }
 
-// DeriveKeyFromPassphrase derives a 32-byte session key from a user passphrase using SHA-256.
+// DeriveKeyFromPassphrase derives a 32-byte session key from a user passphrase using
+// PBKDF2 with 100,000 iterations of HMAC-SHA256, protecting against GPU dictionary attacks.
 func DeriveKeyFromPassphrase(passphrase string) [32]byte {
-	return sha256.Sum256([]byte("badsharing-passphrase-v1:" + passphrase))
+	var key [32]byte
+	derived := pbkdf2.Key([]byte(passphrase), kdfSalt, 100_000, 32, sha256.New)
+	copy(key[:], derived)
+	return key
 }
 
 // GenerateSessionID returns a cryptographically random 64-bit session identifier.

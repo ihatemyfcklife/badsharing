@@ -71,12 +71,6 @@ func runSend(args []string) {
 		os.Exit(1)
 	}
 
-	metaBytes, err := meta.MarshalBinary()
-	if err != nil {
-		fmt.Printf("Error marshaling metadata: %v\n", err)
-		os.Exit(1)
-	}
-
 	raddr, err := net.ResolveUDPAddr("udp", *targetAddr)
 	if err != nil {
 		fmt.Printf("Error resolving target address: %v\n", err)
@@ -91,10 +85,9 @@ func runSend(args []string) {
 	defer conn.Close()
 
 	key := badsharing.DeriveKeyFromPassphrase(*passphrase)
-	sessionID := uint64(0xBADD00D500000001)
 
 	cfg := badsharing.SessionConfig{
-		SessionID:       sessionID,
+		SessionID:       meta.SessionID,
 		SharedKey:       key,
 		WindowSize:      32,
 		RedundancyRatio: *redundancy,
@@ -106,12 +99,19 @@ func runSend(args []string) {
 		os.Exit(1)
 	}
 
-	fmt.Printf("Sending file: %s (%d bytes, %d chunks)\n", meta.Name, meta.Size, meta.TotalChunks)
+	fmt.Printf("Sending file: %s (%d bytes, %d chunks, SessionID=%x)\n",
+		meta.Name, meta.Size, meta.TotalChunks, meta.SessionID)
 	fmt.Printf("Target: %s | Redundancy: %.0f%% | Simulated Loss: %.0f%%\n", *targetAddr, *redundancy*100, *simLoss*100)
 
-	// Send metadata header first (repeated 5 times to ensure reception over lossy link)
+	// Send authenticated encrypted metadata header first (repeated 5 times for lossy links)
+	encMetaBytes, err := meta.MarshalEncrypted(key)
+	if err != nil {
+		fmt.Printf("Error sealing metadata: %v\n", err)
+		os.Exit(1)
+	}
+
 	for i := 0; i < 5; i++ {
-		_, _ = conn.Write(metaBytes)
+		_, _ = conn.Write(encMetaBytes)
 		time.Sleep(10 * time.Millisecond)
 	}
 
@@ -142,9 +142,9 @@ func runSend(args []string) {
 			os.Exit(1)
 		}
 
-		// Micro-throttle to prevent UDP socket buffer overflow on localhost
+		// Pacing to prevent kernel UDP buffer overflows
 		if sentFrames%32 == 0 {
-			time.Sleep(1 * time.Millisecond)
+			time.Sleep(100 * time.Microsecond)
 		}
 	}
 
@@ -181,7 +181,9 @@ func runRecv(args []string) {
 	buf := make([]byte, 2048)
 	var meta badsharing.FileMetadata
 
-	// Step 1: Wait for metadata packet
+	key := badsharing.DeriveKeyFromPassphrase(*passphrase)
+
+	// Step 1: Wait for metadata packet (authenticated encrypted or plaintext)
 	for {
 		n, _, err := conn.ReadFromUDP(buf)
 		if err != nil {
@@ -189,10 +191,16 @@ func runRecv(args []string) {
 			os.Exit(1)
 		}
 
-		if bytes.HasPrefix(buf[:n], badsharing.MagicHeader[:]) {
+		if bytes.HasPrefix(buf[:n], badsharing.MagicEncryptedHeader[:]) {
+			if err := meta.UnmarshalEncrypted(buf[:n], key); err == nil {
+				fmt.Printf("Received authenticated encrypted metadata: %s (%d bytes, SHA256=%x, SessionID=%x)\n",
+					meta.Name, meta.Size, meta.Checksum, meta.SessionID)
+				break
+			}
+		} else if bytes.HasPrefix(buf[:n], badsharing.MagicHeader[:]) {
 			if err := meta.UnmarshalBinary(buf[:n]); err == nil {
-				fmt.Printf("Received metadata: %s (%d bytes, SHA256=%x)\n",
-					meta.Name, meta.Size, meta.Checksum)
+				fmt.Printf("Received metadata: %s (%d bytes, SHA256=%x, SessionID=%x)\n",
+					meta.Name, meta.Size, meta.Checksum, meta.SessionID)
 				break
 			}
 		}
@@ -202,25 +210,24 @@ func runRecv(args []string) {
 	if destinationPath == "" {
 		destinationPath = "received_" + filepath.Base(filepath.Clean(meta.Name))
 	}
+	partPath := destinationPath + ".part"
 
-	outFile, err := os.Create(destinationPath)
+	outFile, err := os.Create(partPath)
 	if err != nil {
 		fmt.Printf("Error creating output file: %v\n", err)
 		os.Exit(1)
 	}
-	defer outFile.Close()
-
-	key := badsharing.DeriveKeyFromPassphrase(*passphrase)
-	sessionID := uint64(0xBADD00D500000001)
 
 	cfg := badsharing.SessionConfig{
-		SessionID:  sessionID,
+		SessionID:  meta.SessionID,
 		SharedKey:  key,
 		WindowSize: 32,
 	}
 
 	receiver, err := badsharing.NewReceiver(&meta, outFile, cfg)
 	if err != nil {
+		_ = outFile.Close()
+		_ = os.Remove(partPath)
 		fmt.Printf("Error initializing receiver: %v\n", err)
 		os.Exit(1)
 	}
@@ -239,7 +246,7 @@ func runRecv(args []string) {
 		_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
 
 		// Skip metadata packets
-		if bytes.HasPrefix(buf[:n], badsharing.MagicHeader[:]) {
+		if bytes.HasPrefix(buf[:n], badsharing.MagicHeader[:]) || bytes.HasPrefix(buf[:n], badsharing.MagicEncryptedHeader[:]) {
 			continue
 		}
 
@@ -249,8 +256,17 @@ func runRecv(args []string) {
 		}
 	}
 
+	_ = outFile.Close()
+
 	if err := receiver.Close(); err != nil {
+		_ = os.Remove(partPath)
 		fmt.Printf("Transfer verification failed: %v\n", err)
+		os.Exit(1)
+	}
+
+	// Atomically finalize file
+	if err := os.Rename(partPath, destinationPath); err != nil {
+		fmt.Printf("Error finalizing destination file: %v\n", err)
 		os.Exit(1)
 	}
 

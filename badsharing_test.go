@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"crypto/rand"
 	"crypto/sha256"
+	"encoding/binary"
 	"io"
 	mrand "math/rand/v2"
 	"sync"
@@ -533,6 +534,167 @@ func TestConcurrentIngest(t *testing.T) {
 
 	if !bytes.Equal(destBuf.Bytes(), sourceData) {
 		t.Fatalf("reconstructed data mismatch under concurrent ingestion")
+	}
+}
+
+// TestMetadata_EncryptedRoundTrip validates authenticated encryption and decryption of FileMetadata.
+func TestMetadata_EncryptedRoundTrip(t *testing.T) {
+	data := []byte("Top secret file metadata content.")
+	meta, err := NewFileMetadata("classified.docx", bytes.NewReader(data))
+	if err != nil {
+		t.Fatalf("NewFileMetadata failed: %v", err)
+	}
+
+	key1 := DeriveKeyFromPassphrase("correct-horse-battery-staple")
+	key2 := DeriveKeyFromPassphrase("wrong-password")
+
+	encData, err := meta.MarshalEncrypted(key1)
+	if err != nil {
+		t.Fatalf("MarshalEncrypted failed: %v", err)
+	}
+
+	// 1. Successful decryption with correct key
+	var parsed FileMetadata
+	if err := parsed.UnmarshalEncrypted(encData, key1); err != nil {
+		t.Fatalf("UnmarshalEncrypted with correct key failed: %v", err)
+	}
+	if parsed.Name != meta.Name || parsed.Size != meta.Size || parsed.SessionID != meta.SessionID {
+		t.Fatalf("decrypted metadata fields do not match original")
+	}
+
+	// 2. Decryption fails with incorrect key
+	var parsedWrong FileMetadata
+	if err := parsedWrong.UnmarshalEncrypted(encData, key2); err == nil {
+		t.Fatalf("expected error when decrypting with incorrect key, got nil")
+	}
+
+	// 3. Decryption fails if ciphertext is tampered with
+	tampered := make([]byte, len(encData))
+	copy(tampered, encData)
+	tampered[len(tampered)-1] ^= 0x01 // Flip Poly1305 tag bit
+	var parsedTampered FileMetadata
+	if err := parsedTampered.UnmarshalEncrypted(tampered, key1); err == nil {
+		t.Fatalf("expected error when decrypting tampered metadata, got nil")
+	}
+}
+
+// TestMetadata_Version1Compatibility verifies backward-compatible parsing of ProtocolVersion1 metadata.
+func TestMetadata_Version1Compatibility(t *testing.T) {
+	name := "legacy-file.bin"
+	nameBytes := []byte(name)
+	size := uint64(1024)
+	chunkSize := uint16(DefaultChunkSize)
+	totalChunks := uint64(1)
+
+	// Construct raw ProtocolVersion1 packet
+	buf := make([]byte, 4+1+8+32+2+8+1+len(nameBytes))
+	copy(buf[0:4], MagicHeader[:])
+	buf[4] = ProtocolVersion1
+	binary.BigEndian.PutUint64(buf[5:13], size)
+	// Checksum at 13..45 is left as zeroes
+	binary.BigEndian.PutUint16(buf[45:47], chunkSize)
+	binary.BigEndian.PutUint64(buf[47:55], totalChunks)
+	buf[55] = uint8(len(nameBytes))
+	copy(buf[56:], nameBytes)
+
+	var meta FileMetadata
+	if err := meta.UnmarshalBinary(buf); err != nil {
+		t.Fatalf("UnmarshalBinary failed for ProtocolVersion1: %v", err)
+	}
+
+	if meta.Name != name {
+		t.Fatalf("expected name %q, got %q", name, meta.Name)
+	}
+	if meta.Size != size {
+		t.Fatalf("expected size %d, got %d", size, meta.Size)
+	}
+	if meta.SessionID != 0 {
+		t.Fatalf("expected SessionID=0 for v1, got %x", meta.SessionID)
+	}
+}
+
+// TestZeroByteFile verifies end-to-end handling of empty (0-byte) files.
+func TestZeroByteFile(t *testing.T) {
+	meta, err := NewFileMetadata("empty.txt", bytes.NewReader([]byte{}))
+	if err != nil {
+		t.Fatalf("NewFileMetadata failed: %v", err)
+	}
+	if meta.Size != 0 || meta.TotalChunks != 0 {
+		t.Fatalf("expected 0 size and chunks, got size=%d chunks=%d", meta.Size, meta.TotalChunks)
+	}
+
+	key, _ := GenerateRandomKey()
+	cfg := SessionConfig{
+		SessionID:  meta.SessionID,
+		SharedKey:  key,
+		WindowSize: 32,
+	}
+
+	sender, err := NewSender(meta, bytes.NewReader([]byte{}), cfg)
+	if err != nil {
+		t.Fatalf("NewSender failed: %v", err)
+	}
+
+	var dest bytes.Buffer
+	receiver, err := NewReceiver(meta, &dest, cfg)
+	if err != nil {
+		t.Fatalf("NewReceiver failed: %v", err)
+	}
+
+	if !receiver.IsComplete() {
+		t.Fatalf("expected receiver to be complete immediately for 0-byte file")
+	}
+	_, _, pct := receiver.Progress()
+	if pct != 100.0 {
+		t.Fatalf("expected 100%% progress for empty file, got %.1f%%", pct)
+	}
+
+	frame, eof, err := sender.NextFrame()
+	if err != nil {
+		t.Fatalf("NextFrame failed: %v", err)
+	}
+	if !eof || frame != nil {
+		t.Fatalf("expected immediate EOF on empty file")
+	}
+
+	if err := receiver.Close(); err != nil {
+		t.Fatalf("Close failed on 0-byte receiver: %v", err)
+	}
+	if dest.Len() != 0 {
+		t.Fatalf("expected empty destination, got %d bytes", dest.Len())
+	}
+}
+
+// TestDynamicSessionID verifies that fresh session IDs are generated to eliminate nonce reuse.
+func TestDynamicSessionID(t *testing.T) {
+	meta1, err := NewFileMetadata("file1.bin", bytes.NewReader([]byte("test1")))
+	if err != nil {
+		t.Fatalf("NewFileMetadata 1 failed: %v", err)
+	}
+	meta2, err := NewFileMetadata("file2.bin", bytes.NewReader([]byte("test2")))
+	if err != nil {
+		t.Fatalf("NewFileMetadata 2 failed: %v", err)
+	}
+
+	if meta1.SessionID == 0 || meta2.SessionID == 0 {
+		t.Fatalf("expected non-zero session IDs")
+	}
+	if meta1.SessionID == meta2.SessionID {
+		t.Fatalf("expected distinct session IDs, got identical: %x", meta1.SessionID)
+	}
+}
+
+// TestPBKDF2KeyDerivation verifies consistent and domain-separated key stretching.
+func TestPBKDF2KeyDerivation(t *testing.T) {
+	k1 := DeriveKeyFromPassphrase("password123")
+	k2 := DeriveKeyFromPassphrase("password123")
+	k3 := DeriveKeyFromPassphrase("different-pass")
+
+	if !bytes.Equal(k1[:], k2[:]) {
+		t.Fatalf("expected deterministic key derivation for same passphrase")
+	}
+	if bytes.Equal(k1[:], k3[:]) {
+		t.Fatalf("expected different keys for different passphrases")
 	}
 }
 
