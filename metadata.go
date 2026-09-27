@@ -24,13 +24,20 @@ const (
 	// ProtocolVersion2 includes a dynamic 64-bit SessionID in metadata to eliminate nonce reuse.
 	ProtocolVersion2 = 0x02
 
+	// ProtocolVersion3 adds GenerationSize for batch/generation-based RLNC network coding.
+	ProtocolVersion3 = 0x03
+
 	// ProtocolVersion is the default wire version for newly generated metadata.
-	ProtocolVersion = ProtocolVersion2
+	ProtocolVersion = ProtocolVersion3
 
 	// DefaultChunkSize is the size in bytes of raw file chunks fed into the RLNC encoder.
 	// 1280 bytes guarantees that with extended headers (48B) and length prefixes (2B),
 	// the total shard wire size is <= 1344 bytes (calibrated badcrypt AEAD frame).
 	DefaultChunkSize = 1280
+
+	// DefaultGenerationSize specifies the number of chunks grouped into one independent RLNC generation.
+	// 64 chunks fits perfectly in a 64-bit compact bitmask with constant O(1) CPU and constant memory.
+	DefaultGenerationSize = 64
 
 	// MaxChunkSize is the maximum permitted chunk size to guarantee fit within badcrypt frame plaintext.
 	MaxChunkSize = 1300
@@ -49,12 +56,21 @@ var (
 
 // FileMetadata encapsulates essential file characteristics and cryptographic integrity anchors.
 type FileMetadata struct {
-	SessionID   uint64   `json:"session_id"`
-	Name        string   `json:"name"`
-	Size        uint64   `json:"size"`
-	Checksum    [32]byte `json:"checksum"` // SHA-256 hash of original file
-	ChunkSize   uint16   `json:"chunk_size"`
-	TotalChunks uint64   `json:"total_chunks"`
+	SessionID      uint64   `json:"session_id"`
+	Name           string   `json:"name"`
+	Size           uint64   `json:"size"`
+	Checksum       [32]byte `json:"checksum"` // SHA-256 hash of original file
+	ChunkSize      uint16   `json:"chunk_size"`
+	GenerationSize uint16   `json:"generation_size"`
+	TotalChunks    uint64   `json:"total_chunks"`
+}
+
+// TotalGenerations returns the total number of generations required to transmit the entire file.
+func (m *FileMetadata) TotalGenerations() uint64 {
+	if m.GenerationSize == 0 || m.TotalChunks == 0 {
+		return 1
+	}
+	return (m.TotalChunks + uint64(m.GenerationSize) - 1) / uint64(m.GenerationSize)
 }
 
 // NewFileMetadata computes metadata from an io.ReadSeeker by hashing the content with SHA-256.
@@ -89,38 +105,45 @@ func NewFileMetadata(name string, r io.ReadSeeker) (*FileMetadata, error) {
 	}
 
 	return &FileMetadata{
-		SessionID:   GenerateSessionID(),
-		Name:        cleanName,
-		Size:        uint64(size),
-		Checksum:    sum,
-		ChunkSize:   chunkSize,
-		TotalChunks: totalChunks,
+		SessionID:      GenerateSessionID(),
+		Name:           cleanName,
+		Size:           uint64(size),
+		Checksum:       sum,
+		ChunkSize:      chunkSize,
+		GenerationSize: DefaultGenerationSize,
+		TotalChunks:    totalChunks,
 	}, nil
 }
 
 // MarshalBinary encodes FileMetadata into binary format:
-// [4B Magic] [1B Version] [8B SessionID] [8B Size] [32B SHA-256] [2B ChunkSize] [8B TotalChunks] [1B NameLen] [NameBytes]
+// [4B Magic] [1B Version] [8B SessionID] [8B Size] [32B SHA-256] [2B ChunkSize] [2B GenSize] [8B TotalChunks] [1B NameLen] [NameBytes]
 func (m *FileMetadata) MarshalBinary() ([]byte, error) {
 	nameBytes := []byte(m.Name)
 	if len(nameBytes) > MaxFileNameLength {
 		return nil, ErrFileNameTooLong
 	}
 
-	buf := make([]byte, 4+1+8+8+32+2+8+1+len(nameBytes))
+	genSize := m.GenerationSize
+	if genSize == 0 {
+		genSize = DefaultGenerationSize
+	}
+
+	buf := make([]byte, 4+1+8+8+32+2+2+8+1+len(nameBytes))
 	copy(buf[0:4], MagicHeader[:])
-	buf[4] = ProtocolVersion2
+	buf[4] = ProtocolVersion3
 	binary.BigEndian.PutUint64(buf[5:13], m.SessionID)
 	binary.BigEndian.PutUint64(buf[13:21], m.Size)
 	copy(buf[21:53], m.Checksum[:])
 	binary.BigEndian.PutUint16(buf[53:55], m.ChunkSize)
-	binary.BigEndian.PutUint64(buf[55:63], m.TotalChunks)
-	buf[63] = uint8(len(nameBytes))
-	copy(buf[64:], nameBytes)
+	binary.BigEndian.PutUint16(buf[55:57], genSize)
+	binary.BigEndian.PutUint64(buf[57:65], m.TotalChunks)
+	buf[65] = uint8(len(nameBytes))
+	copy(buf[66:], nameBytes)
 
 	return buf, nil
 }
 
-// UnmarshalBinary parses binary-encoded FileMetadata, supporting ProtocolVersion1 and ProtocolVersion2.
+// UnmarshalBinary parses binary-encoded FileMetadata, supporting ProtocolVersion1, ProtocolVersion2, and ProtocolVersion3.
 func (m *FileMetadata) UnmarshalBinary(data []byte) error {
 	if len(data) < 56 {
 		return ErrCorruptMetadata
@@ -135,6 +158,7 @@ func (m *FileMetadata) UnmarshalBinary(data []byte) error {
 		m.Size = binary.BigEndian.Uint64(data[5:13])
 		copy(m.Checksum[:], data[13:45])
 		m.ChunkSize = binary.BigEndian.Uint16(data[45:47])
+		m.GenerationSize = DefaultGenerationSize
 		if m.ChunkSize == 0 || m.ChunkSize > MaxChunkSize {
 			return ErrInvalidChunkSize
 		}
@@ -160,6 +184,7 @@ func (m *FileMetadata) UnmarshalBinary(data []byte) error {
 		m.Size = binary.BigEndian.Uint64(data[13:21])
 		copy(m.Checksum[:], data[21:53])
 		m.ChunkSize = binary.BigEndian.Uint16(data[53:55])
+		m.GenerationSize = DefaultGenerationSize
 		if m.ChunkSize == 0 || m.ChunkSize > MaxChunkSize {
 			return ErrInvalidChunkSize
 		}
@@ -170,6 +195,35 @@ func (m *FileMetadata) UnmarshalBinary(data []byte) error {
 			return ErrCorruptMetadata
 		}
 		rawName := string(data[64 : 64+nameLen])
+		cleanName := filepath.Base(filepath.Clean(rawName))
+		if cleanName == "." || cleanName == "/" || cleanName == "" {
+			cleanName = "unnamed.bin"
+		}
+		m.Name = cleanName
+		return nil
+
+	case ProtocolVersion3:
+		if len(data) < 66 {
+			return ErrCorruptMetadata
+		}
+		m.SessionID = binary.BigEndian.Uint64(data[5:13])
+		m.Size = binary.BigEndian.Uint64(data[13:21])
+		copy(m.Checksum[:], data[21:53])
+		m.ChunkSize = binary.BigEndian.Uint16(data[53:55])
+		m.GenerationSize = binary.BigEndian.Uint16(data[55:57])
+		if m.GenerationSize == 0 {
+			m.GenerationSize = DefaultGenerationSize
+		}
+		if m.ChunkSize == 0 || m.ChunkSize > MaxChunkSize {
+			return ErrInvalidChunkSize
+		}
+		m.TotalChunks = binary.BigEndian.Uint64(data[57:65])
+
+		nameLen := int(data[65])
+		if len(data) < 66+nameLen {
+			return ErrCorruptMetadata
+		}
+		rawName := string(data[66 : 66+nameLen])
 		cleanName := filepath.Base(filepath.Clean(rawName))
 		if cleanName == "." || cleanName == "/" || cleanName == "" {
 			cleanName = "unnamed.bin"

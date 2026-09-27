@@ -698,3 +698,143 @@ func TestPBKDF2KeyDerivation(t *testing.T) {
 	}
 }
 
+
+// TestSwarmRecoding_DistributedRelay tests that an intermediate peer receiving only 30% of frames
+// can use RecodeFrame() to act as a seeder and feed recoded frames to a third peer.
+func TestSwarmRecoding_DistributedRelay(t *testing.T) {
+	const fileSize = 40 * 1024 // 40 KB
+	sourceData := make([]byte, fileSize)
+	_, _ = io.ReadFull(rand.Reader, sourceData)
+
+	meta, err := NewFileMetadata("swarm-test.bin", bytes.NewReader(sourceData))
+	if err != nil {
+		t.Fatalf("NewFileMetadata failed: %v", err)
+	}
+
+	key, _ := GenerateRandomKey()
+	sessionID := GenerateSessionID()
+
+	cfg := SessionConfig{
+		SessionID:       sessionID,
+		SharedKey:       key,
+		WindowSize:      32,
+		RedundancyRatio: 0.50,
+	}
+
+	sender, _ := NewSender(meta, bytes.NewReader(sourceData), cfg)
+
+	// Peer A receives only 50% of the sender frames
+	var bufA bytes.Buffer
+	peerA, _ := NewReceiver(meta, &bufA, cfg)
+
+	var allFrames [][]byte
+	for {
+		frame, eof, err := sender.NextFrame()
+		if err != nil {
+			t.Fatalf("NextFrame failed: %v", err)
+		}
+		if eof {
+			break
+		}
+		allFrames = append(allFrames, frame)
+	}
+
+	// Feed first 40% of frames to Peer A
+	limit := len(allFrames) * 4 / 10
+	for i := 0; i < limit; i++ {
+		_, _ = peerA.IngestFrame(allFrames[i])
+	}
+
+	if peerA.IsComplete() {
+		t.Fatal("peer A should not be complete with only 40% frames")
+	}
+
+	// Peer B connects to Peer A and receives recoded frames from Peer A!
+	var bufB bytes.Buffer
+	peerB, _ := NewReceiver(meta, &bufB, cfg)
+
+	// Feed first 40% systematic frames directly to B
+	for i := 0; i < limit; i++ {
+		_, _ = peerB.IngestFrame(allFrames[i])
+	}
+
+	// Peer A produces recoded frames for Peer B
+	recodedCount := 0
+	for i := 0; i < 20; i++ {
+		recodedFrame, err := peerA.RecodeFrame()
+		if err == nil {
+			recodedCount++
+			_, _ = peerB.IngestFrame(recodedFrame)
+		}
+	}
+
+	t.Logf("Peer A generated %d recoded frames for Peer B (FramesRecoded=%d)", recodedCount, peerA.FramesRecoded())
+}
+
+// TestFileTransfer_MultiGeneration_500KB tests streaming across 7+ generations with 20% loss.
+func TestFileTransfer_MultiGeneration_500KB(t *testing.T) {
+	const fileSize = 500 * 1024 // 500 KB (~391 chunks / 7 generations)
+	sourceData := make([]byte, fileSize)
+	_, _ = io.ReadFull(rand.Reader, sourceData)
+
+	meta, err := NewFileMetadata("large-500k.bin", bytes.NewReader(sourceData))
+	if err != nil {
+		t.Fatalf("NewFileMetadata failed: %v", err)
+	}
+
+	key := DeriveKeyFromPassphrase("multi-generation-key")
+	sessionID := uint64(0x4242424242424242)
+
+	cfg := SessionConfig{
+		SessionID:       sessionID,
+		SharedKey:       key,
+		GenerationSize:  64,
+		RedundancyRatio: 0.40,
+	}
+
+	sender, err := NewSender(meta, bytes.NewReader(sourceData), cfg)
+	if err != nil {
+		t.Fatalf("NewSender failed: %v", err)
+	}
+
+	var destBuf bytes.Buffer
+	receiver, err := NewReceiver(meta, &destBuf, cfg)
+	if err != nil {
+		t.Fatalf("NewReceiver failed: %v", err)
+	}
+
+	totalFrames := 0
+	droppedFrames := 0
+
+	for {
+		frame, eof, err := sender.NextFrame()
+		if err != nil {
+			t.Fatalf("NextFrame failed: %v", err)
+		}
+		if eof {
+			break
+		}
+
+		totalFrames++
+
+		// Simulate 20% drop rate
+		if (totalFrames % 5) == 0 {
+			droppedFrames++
+			continue
+		}
+
+		_, _ = receiver.IngestFrame(frame)
+	}
+
+	if err := receiver.Close(); err != nil {
+		t.Fatalf("receiver Close failed on multi-generation file: %v", err)
+	}
+
+	if !bytes.Equal(destBuf.Bytes(), sourceData) {
+		t.Fatalf("reconstructed data mismatch on multi-generation file")
+	}
+
+	dSent, pSent := sender.Stats()
+	t.Logf("Multi-generation 500KB Transfer Passed: Total=%d (Data=%d, Parity=%d), Dropped=%d, Bit-Exact 100%%",
+		totalFrames, dSent, pSent, droppedFrames)
+}

@@ -27,6 +27,7 @@ type SessionConfig struct {
 	SessionID       uint64
 	SharedKey       [32]byte
 	WindowSize      int
+	GenerationSize  int
 	RedundancyRatio float64
 }
 

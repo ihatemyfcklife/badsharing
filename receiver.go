@@ -43,6 +43,10 @@ type Receiver struct {
 	statsMu        sync.Mutex
 	framesReceived uint64
 	framesDropped  uint64
+	framesRecoded  uint64
+
+	recoderMu sync.Mutex
+	recoder   *badrlnc.SwarmRecoder
 }
 
 // NewReceiver creates a new file receiving pipeline.
@@ -66,6 +70,11 @@ func NewReceiver(meta *FileMetadata, w io.Writer, cfg SessionConfig) (*Receiver,
 		hasher:    sha256.New(),
 		plainBuf:  make([]byte, badcrypt.DefaultPlaintextFrameSize),
 		completed: meta.Size == 0,
+		recoder: badrlnc.NewSwarmRecoder(badrlnc.RecoderConfig{
+			Capacity:   128,
+			SymbolSize: int(meta.ChunkSize),
+			Checksum:   true,
+		}),
 	}
 
 	// 1. Resequencer delivers packets strictly monotonically (0, 1, 2, ...) to writer
@@ -162,6 +171,11 @@ func (r *Receiver) IngestFrame(wireFrame []byte) (bool, error) {
 	shard = shard.Clone()
 	r.ingestMu.Unlock()
 
+	// Buffer innovative shard into recoder pool for distributed swarm P2P recoding
+	r.recoderMu.Lock()
+	r.recoder.AddShard(shard)
+	r.recoderMu.Unlock()
+
 	// 3. Feed shard into incremental solver (solverMu synchronizes decoder and resequencer emissions)
 	r.solverMu.Lock()
 	_, pushErr := r.decoder.PushShard(shard)
@@ -182,6 +196,40 @@ func (r *Receiver) IngestFrame(wireFrame []byte) (bool, error) {
 	r.writeMu.Unlock()
 
 	return done, nil
+}
+
+// RecodeFrame produces a new innovative random linear combination over GF(2)
+// from the currently received shards and seals it into an authenticated wire frame.
+// This allows intermediate peers to act as active swarm seeders even with partial file data.
+func (r *Receiver) RecodeFrame() ([]byte, error) {
+	r.recoderMu.Lock()
+	shard, err := r.recoder.Recode()
+	r.recoderMu.Unlock()
+	if err != nil {
+		return nil, err
+	}
+
+	r.statsMu.Lock()
+	r.framesRecoded++
+	r.statsMu.Unlock()
+
+	plainBuf := make([]byte, badcrypt.DefaultPlaintextFrameSize)
+	wireBuf := make([]byte, badcrypt.ConstantWireFrameSize)
+
+	n, err := shard.EncodeTo(plainBuf)
+	if err != nil {
+		return nil, fmt.Errorf("badsharing: failed to encode recoded shard: %w", err)
+	}
+	clear(plainBuf[n:])
+
+	sealed, err := r.aead.SealFrame(wireBuf, plainBuf)
+	if err != nil {
+		return nil, fmt.Errorf("badsharing: failed to seal recoded frame: %w", err)
+	}
+
+	out := make([]byte, len(sealed))
+	copy(out, sealed)
+	return out, nil
 }
 
 // Close flushes the resequencer and verifies end-to-end file integrity against meta.Checksum.
@@ -234,9 +282,27 @@ func (r *Receiver) Progress() (bytesReceived, totalBytes uint64, percent float64
 	return r.bytesWritten, r.meta.Size, pct
 }
 
-// Stats returns frame reception metrics.
+// CurrentGeneration returns the active generation index being processed.
+func (r *Receiver) CurrentGeneration() uint64 {
+	r.writeMu.Lock()
+	defer r.writeMu.Unlock()
+	genSize := uint64(r.meta.GenerationSize)
+	if genSize == 0 {
+		genSize = DefaultGenerationSize
+	}
+	return r.chunksDecoded / genSize
+}
+
+// Stats returns frame reception metrics: framesReceived and framesDropped.
 func (r *Receiver) Stats() (framesReceived, framesDropped uint64) {
 	r.statsMu.Lock()
 	defer r.statsMu.Unlock()
 	return r.framesReceived, r.framesDropped
+}
+
+// FramesRecoded returns the total number of recoded parity frames produced for the swarm.
+func (r *Receiver) FramesRecoded() uint64 {
+	r.statsMu.Lock()
+	defer r.statsMu.Unlock()
+	return r.framesRecoded
 }

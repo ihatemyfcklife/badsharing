@@ -10,7 +10,7 @@ import (
 	"github.com/ihatemyfcklife/badrlnc"
 )
 
-// Sender coordinates file streaming, sliding-window RLNC encoding, and badcrypt AEAD frame sealing.
+// Sender coordinates file streaming, generation-based RLNC encoding, and badcrypt AEAD frame sealing.
 type Sender struct {
 	mu                sync.Mutex
 	meta              *FileMetadata
@@ -21,17 +21,19 @@ type Sender struct {
 	dataPacketsSent   uint64
 	parityPacketsSent uint64
 	eof               bool
-	flushedCount      int
-	maxTailFlushes    int
+
+	generationSize   int
+	currentGen       uint64
+	genChunksRead    int
+	genParityEmitted int
+	targetGenParity  int
 
 	chunkBuf []byte
 	plainBuf []byte
 	wireBuf  []byte
-
-	pendingParity *badrlnc.Shard
 }
 
-// NewSender creates a new file streaming Sender.
+// NewSender creates a new file streaming Sender with generation-based partitioning.
 func NewSender(meta *FileMetadata, r io.Reader, cfg SessionConfig) (*Sender, error) {
 	if meta == nil {
 		return nil, errors.New("badsharing: metadata cannot be nil")
@@ -40,9 +42,12 @@ func NewSender(meta *FileMetadata, r io.Reader, cfg SessionConfig) (*Sender, err
 		return nil, errors.New("badsharing: reader cannot be nil")
 	}
 
-	windowSize := cfg.WindowSize
-	if windowSize <= 0 {
-		windowSize = DefaultWindowSize
+	genSize := int(meta.GenerationSize)
+	if genSize <= 0 {
+		genSize = DefaultGenerationSize
+	}
+	if cfg.GenerationSize > 0 {
+		genSize = cfg.GenerationSize
 	}
 
 	redundancy := cfg.RedundancyRatio
@@ -56,19 +61,12 @@ func NewSender(meta *FileMetadata, r io.Reader, cfg SessionConfig) (*Sender, err
 	}
 
 	enc := badrlnc.NewSlidingEncoder(badrlnc.EncoderConfig{
-		WindowSize: windowSize,
+		WindowSize: genSize,
 		SymbolSize: int(meta.ChunkSize),
 		Checksum:   true,
 		ZeroCopy:   false,
+		InitialSeq: 0,
 	})
-
-	// Calibrate tail parity count: the final window contains up to windowSize unacknowledged
-	// packets that cannot benefit from subsequent sliding passes. Emitting 2 * windowSize
-	// tail parity flushes guarantees full rank over GF(2) even under severe tail burst losses.
-	tailFlushes := 2 * windowSize
-	if tailFlushes < 32 {
-		tailFlushes = 32
-	}
 
 	return &Sender{
 		meta:            meta,
@@ -76,29 +74,57 @@ func NewSender(meta *FileMetadata, r io.Reader, cfg SessionConfig) (*Sender, err
 		encoder:         enc,
 		aead:            aead,
 		redundancyRatio: redundancy,
+		generationSize:  genSize,
 		chunkBuf:        make([]byte, meta.ChunkSize),
 		plainBuf:        make([]byte, badcrypt.DefaultPlaintextFrameSize),
 		wireBuf:         make([]byte, badcrypt.ConstantWireFrameSize),
-		maxTailFlushes:  tailFlushes,
+		eof:             meta.Size == 0,
 	}, nil
 }
 
 // NextFrame reads the next chunk, encodes it into a shard, and seals it into a 1380-byte encrypted frame.
-// Returns (frame, eof, error). When eof is true, all file chunks and tail parity shards have been emitted.
+// Returns (frame, eof, error). When eof is true, all file chunks and generation parities have been emitted.
 func (s *Sender) NextFrame() ([]byte, bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	// 1. If we have a pending interleaved parity shard to emit, emit it first
-	if s.pendingParity != nil {
-		shard := *s.pendingParity
-		s.pendingParity = nil
-		s.parityPacketsSent++
-		return s.sealShard(shard)
+	if s.eof && s.genChunksRead == 0 {
+		return nil, true, nil
 	}
 
-	// 2. Read next raw source chunk if not yet EOF
-	if !s.eof {
+	// 1. If we are currently emitting parity shards for the current generation
+	if s.genParityEmitted < s.targetGenParity {
+		shard, err := s.encoder.FlushParity()
+		if err == nil {
+			s.genParityEmitted++
+			s.parityPacketsSent++
+			return s.sealShard(shard)
+		}
+		s.genParityEmitted = s.targetGenParity
+	}
+
+	// 2. If the current generation is completed (all chunks read and parities emitted)
+	if (s.genChunksRead >= s.generationSize || s.eof) && s.targetGenParity > 0 && s.genParityEmitted >= s.targetGenParity {
+		if s.eof {
+			return nil, true, nil
+		}
+
+		s.currentGen++
+		s.genChunksRead = 0
+		s.genParityEmitted = 0
+		s.targetGenParity = 0
+
+		s.encoder = badrlnc.NewSlidingEncoder(badrlnc.EncoderConfig{
+			WindowSize: s.generationSize,
+			SymbolSize: int(s.meta.ChunkSize),
+			Checksum:   true,
+			ZeroCopy:   false,
+			InitialSeq: s.currentGen * uint64(s.generationSize),
+		})
+	}
+
+	// 3. Read and emit the next data chunk for the current generation
+	if !s.eof && s.genChunksRead < s.generationSize {
 		n, err := io.ReadFull(s.reader, s.chunkBuf)
 		if err != nil && err != io.EOF && err != io.ErrUnexpectedEOF {
 			return nil, false, fmt.Errorf("badsharing: read failed: %w", err)
@@ -113,13 +139,18 @@ func (s *Sender) NextFrame() ([]byte, bool, error) {
 			if encErr != nil {
 				return nil, false, fmt.Errorf("badsharing: RLNC push failed: %w", encErr)
 			}
+			s.genChunksRead++
 			s.dataPacketsSent++
 
-			// Check if we should schedule a parity shard
-			expectedParity := uint64(float64(s.dataPacketsSent) * s.redundancyRatio)
-			if expectedParity > s.parityPacketsSent {
-				if parity, pErr := s.encoder.GenerateParity(); pErr == nil {
-					s.pendingParity = &parity
+			// When generation is full or EOF is reached, calibrate parity count for this generation
+			if s.genChunksRead == s.generationSize || s.eof {
+				s.targetGenParity = int(float64(s.genChunksRead)*s.redundancyRatio + 0.999) + 4
+				minParity := int(float64(s.generationSize) * s.redundancyRatio)
+				if minParity < 4 {
+					minParity = 4
+				}
+				if s.targetGenParity < minParity {
+					s.targetGenParity = minParity
 				}
 			}
 
@@ -127,15 +158,31 @@ func (s *Sender) NextFrame() ([]byte, bool, error) {
 		}
 	}
 
-	// 3. File data is fully consumed; emit tail parity flushes to protect burst end
-	if s.flushedCount < s.maxTailFlushes {
-		tailShard, err := s.encoder.FlushParity()
-		if err == nil {
-			s.flushedCount++
-			s.parityPacketsSent++
-			return s.sealShard(tailShard)
+	// 4. If EOF was reached and target parity not yet calculated for this final generation
+	if s.eof && s.targetGenParity == 0 && s.genChunksRead > 0 {
+		s.targetGenParity = int(float64(s.genChunksRead)*s.redundancyRatio + 0.999) + 4
+		minParity := int(float64(s.generationSize) * s.redundancyRatio)
+		if minParity < 4 {
+			minParity = 4
 		}
-		s.flushedCount = s.maxTailFlushes
+		if s.targetGenParity < minParity {
+			s.targetGenParity = minParity
+		}
+	}
+
+	// 5. If we have parity shards to emit for the final generation
+	if s.genParityEmitted < s.targetGenParity {
+		shard, err := s.encoder.FlushParity()
+		if err == nil {
+			s.genParityEmitted++
+			s.parityPacketsSent++
+			return s.sealShard(shard)
+		}
+		s.genParityEmitted = s.targetGenParity
+	}
+
+	if s.eof && s.genParityEmitted >= s.targetGenParity {
+		return nil, true, nil
 	}
 
 	return nil, true, nil
@@ -172,4 +219,11 @@ func (s *Sender) Stats() (dataPackets, parityPackets uint64) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.dataPacketsSent, s.parityPacketsSent
+}
+
+// CurrentGeneration returns the active generation index being transmitted.
+func (s *Sender) CurrentGeneration() uint64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.currentGen
 }
