@@ -1,0 +1,6 @@
+badsharing
+*.exe
+*.test
+*.out
+*.log
+.DS_Store
