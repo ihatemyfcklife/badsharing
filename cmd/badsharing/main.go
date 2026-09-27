@@ -7,6 +7,7 @@ import (
 	"math/rand/v2"
 	"net"
 	"os"
+	"path/filepath"
 	"time"
 
 	"github.com/ihatemyfcklife/badsharing"
@@ -199,7 +200,7 @@ func runRecv(args []string) {
 
 	destinationPath := *outPath
 	if destinationPath == "" {
-		destinationPath = "received_" + meta.Name
+		destinationPath = "received_" + filepath.Base(filepath.Clean(meta.Name))
 	}
 
 	outFile, err := os.Create(destinationPath)

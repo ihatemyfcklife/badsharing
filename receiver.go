@@ -23,21 +23,26 @@ var (
 // Receiver decrypts incoming 1380-byte frames with badcrypt AEAD, feeds validated shards
 // to badrlnc Gauss-Jordan incremental solver, resequences in-order, and writes to an io.Writer.
 type Receiver struct {
-	mu           sync.Mutex
-	meta         *FileMetadata
-	writer       io.Writer
-	aead         *badcrypt.ShardAEAD
-	decoder      *badrlnc.IncrementalDecoder
-	resequencer  *badrlnc.InOrderResequencer
-	hasher       hash.Hash
+	meta        *FileMetadata
+	aead        *badcrypt.ShardAEAD
+	decoder     *badrlnc.IncrementalDecoder
+	resequencer *badrlnc.InOrderResequencer
 
-	bytesWritten     uint64
-	chunksDecoded    uint64
-	framesReceived   uint64
-	framesDropped    uint64
-	completed        bool
-
+	ingestMu sync.Mutex
 	plainBuf []byte
+
+	solverMu sync.Mutex
+
+	writeMu       sync.Mutex
+	writer        io.Writer
+	hasher        hash.Hash
+	bytesWritten  uint64
+	chunksDecoded uint64
+	completed     bool
+
+	statsMu        sync.Mutex
+	framesReceived uint64
+	framesDropped  uint64
 }
 
 // NewReceiver creates a new file receiving pipeline.
@@ -65,8 +70,8 @@ func NewReceiver(meta *FileMetadata, w io.Writer, cfg SessionConfig) (*Receiver,
 	// 1. Resequencer delivers packets strictly monotonically (0, 1, 2, ...) to writer
 	initSeq := uint64(0)
 	r.resequencer = badrlnc.NewInOrderResequencerWithConfig(badrlnc.ResequencerConfig{
-		MaxWait:    500 * time.Millisecond,
-		MaxPending: 2048,
+		MaxWait:    5 * time.Second,
+		MaxPending: 4096,
 		InitialSeq: &initSeq,
 		OnEmit: func(seq uint64, packet []byte) {
 			r.onPacketInOrder(seq, packet)
@@ -75,7 +80,7 @@ func NewReceiver(meta *FileMetadata, w io.Writer, cfg SessionConfig) (*Receiver,
 
 	// 2. Incremental Decoder reconstructs missing packets on-the-fly and pushes to Resequencer
 	r.decoder = badrlnc.NewIncrementalDecoder(badrlnc.DecoderConfig{
-		Capacity:   2048,
+		Capacity:   4096,
 		SymbolSize: int(meta.ChunkSize),
 		ZeroCopy:   false,
 		OnDecoded: func(seq uint64, packet []byte) {
@@ -88,6 +93,9 @@ func NewReceiver(meta *FileMetadata, w io.Writer, cfg SessionConfig) (*Receiver,
 
 // onPacketInOrder writes monotonically ordered packets to the destination stream and tracks integrity.
 func (r *Receiver) onPacketInOrder(seq uint64, packet []byte) {
+	r.writeMu.Lock()
+	defer r.writeMu.Unlock()
+
 	if r.completed {
 		return
 	}
@@ -118,51 +126,74 @@ func (r *Receiver) onPacketInOrder(seq uint64, packet []byte) {
 //
 // Returns (completed, err). If frame is forged or corrupted, err is non-nil and frame is discarded.
 func (r *Receiver) IngestFrame(wireFrame []byte) (bool, error) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-
+	r.statsMu.Lock()
 	r.framesReceived++
+	r.statsMu.Unlock()
 
 	if len(wireFrame) != badcrypt.ConstantWireFrameSize {
+		r.statsMu.Lock()
 		r.framesDropped++
+		r.statsMu.Unlock()
 		return false, fmt.Errorf("%w: expected %d, got %d",
 			ErrInvalidFrameSize, badcrypt.ConstantWireFrameSize, len(wireFrame))
 	}
 
 	// 1. Authenticated Decryption with badcrypt (drops forged or replayed packets)
+	r.ingestMu.Lock()
 	plain, err := r.aead.OpenFrame(r.plainBuf, wireFrame)
 	if err != nil {
+		r.ingestMu.Unlock()
+		r.statsMu.Lock()
 		r.framesDropped++
+		r.statsMu.Unlock()
 		return false, fmt.Errorf("badsharing: frame authentication failed: %w", err)
 	}
 
 	// 2. Decode RLNC shard
 	shard, err := badrlnc.DecodeShard(plain)
 	if err != nil {
+		r.ingestMu.Unlock()
+		r.statsMu.Lock()
 		r.framesDropped++
+		r.statsMu.Unlock()
 		return false, fmt.Errorf("badsharing: shard decoding failed: %w", err)
 	}
+	shard = shard.Clone()
+	r.ingestMu.Unlock()
 
-	// 3. Feed shard into incremental solver
-	if _, err := r.decoder.PushShard(shard); err != nil {
+	// 3. Feed shard into incremental solver (solverMu synchronizes decoder and resequencer emissions)
+	r.solverMu.Lock()
+	_, pushErr := r.decoder.PushShard(shard)
+	r.solverMu.Unlock()
+
+	if pushErr != nil {
 		// Harmless if linearly dependent (no new innovation)
-		if !errors.Is(err, badrlnc.ErrLinearlyDependent) {
+		if !errors.Is(pushErr, badrlnc.ErrLinearlyDependent) {
+			r.statsMu.Lock()
 			r.framesDropped++
-			return false, fmt.Errorf("badsharing: solver error: %w", err)
+			r.statsMu.Unlock()
+			return false, fmt.Errorf("badsharing: solver error: %w", pushErr)
 		}
 	}
 
-	return r.completed, nil
+	r.writeMu.Lock()
+	done := r.completed
+	r.writeMu.Unlock()
+
+	return done, nil
 }
 
 // Close flushes the resequencer and verifies end-to-end file integrity against meta.Checksum.
 func (r *Receiver) Close() error {
-	r.mu.Lock()
-	defer r.mu.Unlock()
+	r.solverMu.Lock()
+	defer r.solverMu.Unlock()
 
 	if r.resequencer != nil {
 		r.resequencer.Close()
 	}
+
+	r.writeMu.Lock()
+	defer r.writeMu.Unlock()
 
 	if r.bytesWritten < r.meta.Size {
 		return fmt.Errorf("badsharing: incomplete transfer: received %d of %d bytes",
@@ -180,15 +211,16 @@ func (r *Receiver) Close() error {
 
 // IsComplete returns true if all file bytes have been successfully received and reconstructed.
 func (r *Receiver) IsComplete() bool {
-	r.mu.Lock()
-	defer r.mu.Unlock()
+	r.writeMu.Lock()
+	defer r.writeMu.Unlock()
 	return r.completed
 }
 
 // Progress returns current transfer metrics.
 func (r *Receiver) Progress() (bytesReceived, totalBytes uint64, percent float64) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
+	r.writeMu.Lock()
+	defer r.writeMu.Unlock()
+
 	pct := 0.0
 	if r.meta.Size > 0 {
 		pct = (float64(r.bytesWritten) / float64(r.meta.Size)) * 100.0
@@ -201,7 +233,7 @@ func (r *Receiver) Progress() (bytesReceived, totalBytes uint64, percent float64
 
 // Stats returns frame reception metrics.
 func (r *Receiver) Stats() (framesReceived, framesDropped uint64) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
+	r.statsMu.Lock()
+	defer r.statsMu.Unlock()
 	return r.framesReceived, r.framesDropped
 }

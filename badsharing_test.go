@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"io"
 	mrand "math/rand/v2"
+	"sync"
 	"testing"
 )
 
@@ -113,12 +114,12 @@ func TestFileTransfer_SimulatedLoss_20Percent(t *testing.T) {
 	key := DeriveKeyFromPassphrase("super-secure-decentralized-passphrase")
 	sessionID := uint64(0xDEADBEEFCAFE1337)
 
-	// 40% parity redundancy to easily overcome 20% random losses
+	// 50% parity redundancy to comfortably overcome 20% random losses
 	cfg := SessionConfig{
 		SessionID:       sessionID,
 		SharedKey:       key,
 		WindowSize:      32,
-		RedundancyRatio: 0.40,
+		RedundancyRatio: 0.50,
 	}
 
 	sender, err := NewSender(meta, bytes.NewReader(sourceData), cfg)
@@ -385,3 +386,153 @@ func BenchmarkFileTransfer(b *testing.B) {
 		_, _ = receiver.IngestFrame(frame)
 	}
 }
+
+// TestMetadata_PathTraversalProtection verifies that directory traversal attacks in metadata are neutralized.
+func TestMetadata_PathTraversalProtection(t *testing.T) {
+	cases := []struct {
+		inputName    string
+		expectedName string
+	}{
+		{"../../../../etc/passwd", "passwd"},
+		{"/root/.ssh/id_rsa", "id_rsa"},
+		{"normal_file.txt", "normal_file.txt"},
+		{"sub/folder/data.csv", "data.csv"},
+		{"", "unnamed.bin"},
+		{".", "unnamed.bin"},
+	}
+
+	for _, tc := range cases {
+		meta := FileMetadata{
+			Name:        tc.inputName,
+			Size:        100,
+			ChunkSize:   DefaultChunkSize,
+			TotalChunks: 1,
+		}
+		buf, err := meta.MarshalBinary()
+		if err != nil {
+			t.Fatalf("MarshalBinary failed for %q: %v", tc.inputName, err)
+		}
+
+		var parsed FileMetadata
+		if err := parsed.UnmarshalBinary(buf); err != nil {
+			t.Fatalf("UnmarshalBinary failed for %q: %v", tc.inputName, err)
+		}
+
+		if parsed.Name != tc.expectedName {
+			t.Fatalf("path traversal not sanitized: input %q, expected %q, got %q",
+				tc.inputName, tc.expectedName, parsed.Name)
+		}
+	}
+}
+
+// TestMetadata_InvalidChunkSize verifies that chunk size bounds are enforced.
+func TestMetadata_InvalidChunkSize(t *testing.T) {
+	// Zero chunk size
+	metaZero := FileMetadata{
+		Name:        "test.txt",
+		Size:        100,
+		ChunkSize:   0,
+		TotalChunks: 1,
+	}
+	bufZero, err := metaZero.MarshalBinary()
+	if err != nil {
+		t.Fatalf("MarshalBinary failed: %v", err)
+	}
+	var parsedZero FileMetadata
+	if err := parsedZero.UnmarshalBinary(bufZero); err != ErrInvalidChunkSize {
+		t.Fatalf("expected ErrInvalidChunkSize for ChunkSize=0, got %v", err)
+	}
+
+	// Oversized chunk size
+	metaHuge := FileMetadata{
+		Name:        "test.txt",
+		Size:        100,
+		ChunkSize:   MaxChunkSize + 1,
+		TotalChunks: 1,
+	}
+	bufHuge, err := metaHuge.MarshalBinary()
+	if err != nil {
+		t.Fatalf("MarshalBinary failed: %v", err)
+	}
+	var parsedHuge FileMetadata
+	if err := parsedHuge.UnmarshalBinary(bufHuge); err != ErrInvalidChunkSize {
+		t.Fatalf("expected ErrInvalidChunkSize for ChunkSize > MaxChunkSize, got %v", err)
+	}
+}
+
+// TestConcurrentIngest validates thread-safety and race-free concurrent frame ingestion.
+func TestConcurrentIngest(t *testing.T) {
+	const fileSize = 128 * 1024 // 128 KB
+	sourceData := make([]byte, fileSize)
+	_, _ = io.ReadFull(rand.Reader, sourceData)
+
+	meta, err := NewFileMetadata("concurrent-test.bin", bytes.NewReader(sourceData))
+	if err != nil {
+		t.Fatalf("NewFileMetadata failed: %v", err)
+	}
+
+	key, _ := GenerateRandomKey()
+	sessionID := GenerateSessionID()
+
+	cfg := SessionConfig{
+		SessionID:       sessionID,
+		SharedKey:       key,
+		WindowSize:      32,
+		RedundancyRatio: 0.30,
+	}
+
+	sender, err := NewSender(meta, bytes.NewReader(sourceData), cfg)
+	if err != nil {
+		t.Fatalf("NewSender failed: %v", err)
+	}
+
+	// Collect all frames from sender
+	var frames [][]byte
+	for {
+		frame, eof, err := sender.NextFrame()
+		if err != nil {
+			t.Fatalf("NextFrame failed: %v", err)
+		}
+		if eof {
+			break
+		}
+		frames = append(frames, frame)
+	}
+
+	var destBuf bytes.Buffer
+	receiver, err := NewReceiver(meta, &destBuf, cfg)
+	if err != nil {
+		t.Fatalf("NewReceiver failed: %v", err)
+	}
+
+	// Concurrently feed frames from 4 goroutines
+	numWorkers := 4
+	var wg sync.WaitGroup
+	frameChan := make(chan []byte, len(frames))
+	for _, f := range frames {
+		frameChan <- f
+	}
+	close(frameChan)
+
+	for i := 0; i < numWorkers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for f := range frameChan {
+				_, _ = receiver.IngestFrame(f)
+				_, _, _ = receiver.Progress()
+			}
+		}()
+	}
+
+	wg.Wait()
+
+	if err := receiver.Close(); err != nil {
+		t.Fatalf("receiver Close failed in concurrent test: %v", err)
+	}
+
+	if !bytes.Equal(destBuf.Bytes(), sourceData) {
+		t.Fatalf("reconstructed data mismatch under concurrent ingestion")
+	}
+}
+

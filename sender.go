@@ -1,9 +1,10 @@
 package badsharing
-
+ 
 import (
 	"errors"
 	"fmt"
 	"io"
+	"sync"
 
 	"github.com/ihatemyfcklife/badcrypt"
 	"github.com/ihatemyfcklife/badrlnc"
@@ -11,6 +12,7 @@ import (
 
 // Sender coordinates file streaming, sliding-window RLNC encoding, and badcrypt AEAD frame sealing.
 type Sender struct {
+	mu                sync.Mutex
 	meta              *FileMetadata
 	reader            io.Reader
 	encoder           *badrlnc.SlidingWindowEncoder
@@ -60,10 +62,12 @@ func NewSender(meta *FileMetadata, r io.Reader, cfg SessionConfig) (*Sender, err
 		ZeroCopy:   false,
 	})
 
-	// Calibrate tail parity count to window size to ensure tail packets survive loss
-	tailFlushes := windowSize / 4
-	if tailFlushes < 2 {
-		tailFlushes = 2
+	// Calibrate tail parity count: the final window contains up to windowSize unacknowledged
+	// packets that cannot benefit from subsequent sliding passes. Emitting 2 * windowSize
+	// tail parity flushes guarantees full rank over GF(2) even under severe tail burst losses.
+	tailFlushes := 2 * windowSize
+	if tailFlushes < 32 {
+		tailFlushes = 32
 	}
 
 	return &Sender{
@@ -82,6 +86,9 @@ func NewSender(meta *FileMetadata, r io.Reader, cfg SessionConfig) (*Sender, err
 // NextFrame reads the next chunk, encodes it into a shard, and seals it into a 1380-byte encrypted frame.
 // Returns (frame, eof, error). When eof is true, all file chunks and tail parity shards have been emitted.
 func (s *Sender) NextFrame() ([]byte, bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
 	// 1. If we have a pending interleaved parity shard to emit, emit it first
 	if s.pendingParity != nil {
 		shard := *s.pendingParity
@@ -162,5 +169,7 @@ func (s *Sender) sealShard(shard badrlnc.Shard) ([]byte, bool, error) {
 
 // Stats returns data and parity transmission statistics.
 func (s *Sender) Stats() (dataPackets, parityPackets uint64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	return s.dataPacketsSent, s.parityPacketsSent
 }

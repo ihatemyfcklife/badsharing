@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"path/filepath"
 )
 
 var (
@@ -23,6 +24,9 @@ const (
 	// the total shard wire size is <= 1344 bytes (calibrated badcrypt AEAD frame).
 	DefaultChunkSize = 1280
 
+	// MaxChunkSize is the maximum permitted chunk size to guarantee fit within badcrypt frame plaintext.
+	MaxChunkSize = 1300
+
 	// MaxFileNameLength is the maximum allowed length of file names in bytes.
 	MaxFileNameLength = 255
 )
@@ -32,6 +36,7 @@ var (
 	ErrUnsupportedVersion = errors.New("badsharing: unsupported protocol version")
 	ErrCorruptMetadata    = errors.New("badsharing: metadata payload is corrupted or truncated")
 	ErrFileNameTooLong    = errors.New("badsharing: filename exceeds maximum allowed length")
+	ErrInvalidChunkSize   = errors.New("badsharing: invalid chunk size in metadata")
 )
 
 // FileMetadata encapsulates essential file characteristics and cryptographic integrity anchors.
@@ -114,13 +119,21 @@ func (m *FileMetadata) UnmarshalBinary(data []byte) error {
 	m.Size = binary.BigEndian.Uint64(data[5:13])
 	copy(m.Checksum[:], data[13:45])
 	m.ChunkSize = binary.BigEndian.Uint16(data[45:47])
+	if m.ChunkSize == 0 || m.ChunkSize > MaxChunkSize {
+		return ErrInvalidChunkSize
+	}
 	m.TotalChunks = binary.BigEndian.Uint64(data[47:55])
 
 	nameLen := int(data[55])
 	if len(data) < 56+nameLen {
 		return ErrCorruptMetadata
 	}
-	m.Name = string(data[56 : 56+nameLen])
+	rawName := string(data[56 : 56+nameLen])
+	cleanName := filepath.Base(filepath.Clean(rawName))
+	if cleanName == "." || cleanName == "/" || cleanName == "" {
+		cleanName = "unnamed.bin"
+	}
+	m.Name = cleanName
 
 	return nil
 }
