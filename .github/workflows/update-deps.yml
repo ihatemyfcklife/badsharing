@@ -1,0 +1,139 @@
+name: Auto Update Dependencies
+
+on:
+  schedule:
+    # Run every 6 hours
+    - cron: '0 */6 * * *'
+  workflow_dispatch:
+  repository_dispatch:
+    types: [dependency-update]
+
+permissions:
+  contents: write
+
+jobs:
+  update-dependencies:
+    name: Check & Update Core Libraries
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code with Full History
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.PAT_TOKEN || secrets.GITHUB_TOKEN }}
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.24'
+          check-latest: true
+          cache: true
+
+      - name: Update Target Dependencies to Latest
+        run: |
+          echo "Updating badcrypt and badrlnc to @latest..."
+          go get github.com/ihatemyfcklife/badcrypt@latest \
+                 github.com/ihatemyfcklife/badrlnc@latest
+          go mod tidy
+
+      - name: Check for Changes
+        id: check_changes
+        run: |
+          if git diff --quiet go.mod go.sum; then
+            echo "All target dependencies are already at their latest versions."
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "Updates detected in go.mod / go.sum."
+            git diff go.mod
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Verify Module and Run Tests
+        if: steps.check_changes.outputs.changed == 'true'
+        run: |
+          echo "Verifying module consistency..."
+          go mod verify
+          echo "Running go vet..."
+          go vet ./...
+          echo "Running core tests with race detector..."
+          go test -v -race -coverprofile=coverage.txt -covermode=atomic ./...
+          echo "Verifying WebAssembly compilation..."
+          GOOS=js GOARCH=wasm go build ./...
+
+      - name: Commit, Tag, and Push Updates
+        id: commit_tag_push
+        if: steps.check_changes.outputs.changed == 'true'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          # Extract updated versions for commit message
+          CRYPT_VER=$(go list -m -f '{{.Version}}' github.com/ihatemyfcklife/badcrypt)
+          RLNC_VER=$(go list -m -f '{{.Version}}' github.com/ihatemyfcklife/badrlnc)
+
+          COMMIT_MSG="chore(deps): bump badcrypt to ${CRYPT_VER}, badrlnc to ${RLNC_VER}"
+          echo "Commit message: $COMMIT_MSG"
+
+          git add go.mod go.sum
+          git commit -m "$COMMIT_MSG"
+
+          # Determine Next Semantic Version & Tag
+          LATEST_TAG=$(git tag -l "v[0-9]*.[0-9]*.[0-9]*" | sort -V | tail -n1)
+          if [ -z "$LATEST_TAG" ]; then
+            NEW_TAG="v1.0.0"
+          else
+            VERSION="${LATEST_TAG#v}"
+            IFS='.' read -r MAJOR MINOR PATCH <<< "$VERSION"
+            NEW_PATCH=$((PATCH + 1))
+            NEW_TAG="v${MAJOR}.${MINOR}.${NEW_PATCH}"
+          fi
+          echo "Tagging release: $NEW_TAG"
+          git tag -a "${NEW_TAG}" -m "Release ${NEW_TAG}: update dependencies (${CRYPT_VER}, ${RLNC_VER})"
+
+          git push origin main
+          git push origin "${NEW_TAG}"
+
+          echo "tag=${NEW_TAG}" >> "$GITHUB_OUTPUT"
+
+      - name: Create GitHub Release
+        if: steps.check_changes.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${{ steps.commit_tag_push.outputs.tag }}"
+          echo "Creating GitHub Release for $TAG..."
+          gh release create "$TAG" \
+            --title "Release $TAG" \
+            --generate-notes
+
+      - name: Warm up Go Proxy & pkg.go.dev
+        if: steps.check_changes.outputs.changed == 'true'
+        run: |
+          TAG="${{ steps.commit_tag_push.outputs.tag }}"
+          echo "Triggering Go proxy indexation for $TAG..."
+
+          for i in {1..8}; do
+            HTTP_ROOT=$(curl -s -o /dev/null -w "%{http_code}" "https://proxy.golang.org/github.com/ihatemyfcklife/badsharing/@v/${TAG}.info" || true)
+            echo "Attempt $i: root status=$HTTP_ROOT"
+
+            if [ "$HTTP_ROOT" = "200" ]; then
+              echo "Module successfully indexed on proxy.golang.org!"
+              break
+            fi
+            sleep 5
+          done
+
+          curl -s "https://pkg.go.dev/github.com/ihatemyfcklife/badsharing@${TAG}" > /dev/null || true
+          echo "Triggered pkg.go.dev documentation build."
+
+      - name: Notify Downstream Repositories
+        if: steps.check_changes.outputs.changed == 'true' && env.PAT_TOKEN != ''
+        env:
+          PAT_TOKEN: ${{ secrets.PAT_TOKEN }}
+        run: |
+          echo "Notifying downstream badhub repository of dependency update..."
+          curl -s -X POST \
+            -H "Authorization: token $PAT_TOKEN" \
+            -H "Accept: application/vnd.github.v3+json" \
+            https://api.github.com/repos/ihatemyfcklife/badhub/dispatches \
+            -d '{"event_type":"dependency-update"}' || true
