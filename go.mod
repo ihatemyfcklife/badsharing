@@ -2,14 +2,9 @@ module github.com/ihatemyfcklife/badsharing
 
 go 1.24.0
 
-replace (
-	github.com/ihatemyfcklife/badcrypt => ../crypt-rlnc
-	github.com/ihatemyfcklife/badrlnc => ../go-rlnc
-)
-
 require (
-	github.com/ihatemyfcklife/badcrypt v0.0.0-00010101000000-000000000000
-	github.com/ihatemyfcklife/badrlnc v0.0.0-00010101000000-000000000000
+	github.com/ihatemyfcklife/badcrypt v1.0.2
+	github.com/ihatemyfcklife/badrlnc v1.0.0
 )
 
 require (
