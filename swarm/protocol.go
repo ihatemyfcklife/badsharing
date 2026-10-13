@@ -130,7 +130,7 @@ func (s *Source) Serve(ctx context.Context, link Link) error {
 				if pause>0 {
 					timer:=time.NewTimer(pause)
 					select {
-					case <-ctx.Done():if !timer.Stop(){<-timer.C};return ctx.Err()
+					case <-ctx.Done():timer.Stop();return ctx.Err()
 					case <-timer.C:
 					}
 				}
