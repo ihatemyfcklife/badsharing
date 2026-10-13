@@ -3,7 +3,7 @@ module github.com/ihatemyfcklife/badsharing/transport/webrtc
 go 1.24.0
 
 require (
-	github.com/ihatemyfcklife/badsharing v2.0.0
+	github.com/ihatemyfcklife/badsharing v1.2.0
 	github.com/pion/webrtc/v4 v4.2.23
 )
 
