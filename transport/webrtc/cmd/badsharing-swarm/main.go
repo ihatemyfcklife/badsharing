@@ -4,6 +4,9 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/binary"
 	"encoding/hex"
 	"flag"
 	"fmt"
@@ -74,6 +77,13 @@ func main() {
 		input,err:=os.Open(*fileName);if err!=nil {log.Fatal(err)}
 		defer input.Close()
 		meta,err:=badsharing.NewFileMetadata(*fileName,input);if err!=nil {log.Fatal(err)}
+		// All seeds of identical content must publish the same manifest identity.
+		// This ID is metadata only; each encrypted frame uses a fresh random SID.
+		idMAC:=hmac.New(sha256.New,key[:])
+		_,_ = idMAC.Write([]byte("badsharing-content-manifest-v1"))
+		_,_ = idMAC.Write(meta.Checksum[:])
+		meta.SessionID=binary.BigEndian.Uint64(idMAC.Sum(nil)[:8])
+		if meta.SessionID==0 {meta.SessionID=1}
 		manifest,err:=badsharing.BuildGenerationManifest(*meta,input,key)
 		if err!=nil {log.Fatal(err)}
 		fmt.Printf("Sharing %s (%d bytes, %d generations) in room %s as %s\n",meta.Name,meta.Size,meta.TotalGenerations(),*room,*peerID)
@@ -127,6 +137,8 @@ ready:
 	fmt.Printf("Receiving %s from %d peer(s); authenticated generations=%d\n",name,len(peerLinks),manifest.Metadata.TotalGenerations())
 	stats,err:=swarm.Download(ctx,manifest,out,key,peerLinks,swarm.DownloadOptions{ReaderAt:out,MaxActiveGenerations:8})
 	if err!=nil {_=out.Close();log.Fatalf("download failed: %v (partial data remains at %s)",err,partial)}
+	// Remove any stale trailing bytes from a previous, larger .part file.
+	if err:=out.Truncate(int64(manifest.Metadata.Size));err!=nil {log.Fatal(err)}
 	if err:=out.Sync();err!=nil{log.Fatal(err)}
 	if err:=out.Close();err!=nil{log.Fatal(err)}
 	if err:=os.Rename(partial,name);err!=nil{log.Fatal(err)}
