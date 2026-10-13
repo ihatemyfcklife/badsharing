@@ -44,9 +44,6 @@ func TestSwarmConcurrentSourcesAndResume(t *testing.T) {
 	partial,err:=os.OpenFile(filepath.Join(t.TempDir(),"download.part"),os.O_RDWR|os.O_CREATE,0600)
 	if err!=nil {t.Fatal(err)}
 	defer partial.Close()
-	g0,err:=badsharing.GenerationRange(*meta,0)
-	_ = g0
-	_ = err
 	off,n,err:=badsharing.GenerationRange(*meta,0)
 	if err!=nil {t.Fatal(err)}
 	if _,err:=partial.WriteAt(payload[off:off+n],off);err!=nil {t.Fatal(err)}
