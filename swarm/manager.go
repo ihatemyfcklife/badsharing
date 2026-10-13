@@ -108,9 +108,10 @@ func Download(ctx context.Context, manifest *badsharing.GenerationManifest, dest
 		for id:=range offline {excluded[id]=true}
 		options:=scheduler.Preferred(gen,excluded)
 		if len(options)==0 {
-			// Retry a previously used peer with a fresh nonce/session.
+			// Retry a previously used peer with a fresh nonce/session, but never
+			// include known-disconnected peers.
+			excluded=make(map[string]bool,len(offline))
 			for id:=range offline {excluded[id]=true}
-			for id:=range task.requested {delete(excluded,id)}
 			options=scheduler.Preferred(gen,excluded)
 		}
 		if len(options)==0 {return fmt.Errorf("swarm: no reachable source for generation %d",gen)}
@@ -166,6 +167,7 @@ func Download(ctx context.Context, manifest *badsharing.GenerationManifest, dest
 			task:=active[g]
 			if task==nil {continue}
 			if kind==wireShard {
+				task.lastRequest=time.Now() // progress resets the idle retry timer
 				stats.FrameCount++
 				done,err:=task.receiver.IngestFrame(payload)
 				if err!=nil {
