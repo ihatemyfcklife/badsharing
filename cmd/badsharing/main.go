@@ -213,6 +213,16 @@ func runRecv(args []string) {
 
 	secret := requirePassphrase(*passphrase)
 	var key [32]byte
+	var lastSalt [badsharing.PassphraseSaltSize]byte
+	var lastKey [32]byte
+	hasSalt := false
+	derivations := 0
+	// Bound memory-hard KDF work triggered by unauthenticated UDP traffic.
+	const maxSaltDerivations = 8
+	if err := conn.SetReadDeadline(time.Now().Add(5 * time.Minute)); err != nil {
+		fmt.Printf("Error setting handshake deadline: %v\n", err)
+		os.Exit(1)
+	}
 
 	// Step 1: wait for per-transfer salt and authenticated encrypted metadata.
 	for {
@@ -222,11 +232,21 @@ func runRecv(args []string) {
 			os.Exit(1)
 		}
 
-		if n >= 20 && bytes.HasPrefix(buf[:n], []byte(passphraseMetadataMagic)) {
+		if n >= 60 && bytes.HasPrefix(buf[:n], []byte(passphraseMetadataMagic)) {
 			var salt [badsharing.PassphraseSaltSize]byte
 			copy(salt[:], buf[4:20])
-			candidate := badsharing.DeriveKeyFromPassphraseWithSalt(secret, salt)
-			if err := meta.UnmarshalEncrypted(buf[20:n], candidate); err == nil {
+			if !hasSalt || salt != lastSalt {
+				if derivations >= maxSaltDerivations {
+					fmt.Fprintln(os.Stderr, "Too many invalid session offers; refusing further key derivations")
+					os.Exit(1)
+				}
+				lastKey = badsharing.DeriveKeyFromPassphraseWithSalt(secret, salt)
+				lastSalt = salt
+				hasSalt = true
+				derivations++
+			}
+			if err := meta.UnmarshalEncrypted(buf[20:n], lastKey); err == nil {
+				candidate := lastKey
 				key = candidate
 				fmt.Printf("Received authenticated encrypted metadata: %s (%d bytes, SHA256=%x, SessionID=%x)\n",
 					meta.Name, meta.Size, meta.Checksum, meta.SessionID)
