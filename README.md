@@ -4,11 +4,10 @@
 [![Go Reference](https://pkg.go.dev/badge/github.com/ihatemyfcklife/badsharing.svg)](https://pkg.go.dev/github.com/ihatemyfcklife/badsharing)
 [![Go Report Card](https://goreportcard.com/badge/github.com/ihatemyfcklife/badsharing)](https://goreportcard.com/report/github.com/ihatemyfcklife/badsharing)
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
-[![Zero Alloc](https://img.shields.io/badge/Allocations-0%20allocs%2Fop-brightgreen.svg)]()
 
 **badsharing** is a decentralized, high-throughput peer-to-peer file distribution engine combining **badrlnc** (Sliding-Window Random Linear Network Coding over $\text{GF}(2)$) and **badcrypt** (ChaCha20-Poly1305 AEAD with anti-replay protection and SessionID multiplexing).
 
-Engineered to operate with zero central servers and fully compilable to **WebAssembly** (`GOOS=js GOARCH=wasm`), `badsharing` streams files over lossy datagram transports (UDP, WebRTC DataChannels) with sub-microsecond in-memory erasure recovery and cryptographic immunity to network coding pollution attacks.
+Designed for direct peer-to-peer data transfer with optional bootstrap peers, and compilable to **WebAssembly** (`GOOS=js GOARCH=wasm`), `badsharing` streams files over lossy datagram transports (UDP, WebRTC DataChannels) with erasure recovery and authentication of frames before they reach the decoder.
 
 ---
 
@@ -107,6 +106,11 @@ Requirements: **Go 1.24+**.
 
 ## Quickstart Guide
 
+The library supports raw 32-byte random session keys (recommended); distribute
+them over an authenticated, out-of-band channel. In both examples below, set
+`BADSHARING_KEY_HEX` to the **same** 64-character hex key on both machines.
+Do not commit the key to source control.
+
 ### 1. Sender Pipeline
 
 ```go
@@ -114,6 +118,7 @@ package main
 
 import (
 	"os"
+	"encoding/hex"
 
 	"github.com/ihatemyfcklife/badsharing"
 )
@@ -130,7 +135,12 @@ func main() {
 		panic(err)
 	}
 
-	key := badsharing.DeriveKeyFromPassphrase("shared-session-secret")
+	keyBytes, err := hex.DecodeString(os.Getenv("BADSHARING_KEY_HEX"))
+	if err != nil || len(keyBytes) != 32 {
+		panic("BADSHARING_KEY_HEX must contain exactly 32 random key bytes in hex")
+	}
+	var key [32]byte
+	copy(key[:], keyBytes)
 	cfg := badsharing.SessionConfig{
 		SessionID:       badsharing.GenerateSessionID(),
 		SharedKey:       key,
@@ -180,9 +190,14 @@ func main() {
 	}
 	defer outFile.Close()
 
-	key := badsharing.DeriveKeyFromPassphrase("shared-session-secret")
+	keyBytes, err := hex.DecodeString(os.Getenv("BADSHARING_KEY_HEX"))
+	if err != nil || len(keyBytes) != 32 {
+		panic("BADSHARING_KEY_HEX must contain exactly 32 random key bytes in hex")
+	}
+	var key [32]byte
+	copy(key[:], keyBytes)
 	cfg := badsharing.SessionConfig{
-		SessionID:  0xBADD00D500000001,
+		SessionID:  meta.SessionID,
 		SharedKey:  key,
 		WindowSize: 32,
 	}
@@ -248,20 +263,73 @@ go build -o badsharing ./cmd/badsharing
 
 ### Start Receiver
 
+The CLI requires a secret; there is **no default passphrase**. Set the same
+strong, random passphrase in the environment of both processes. Avoid `-key`
+when possible because shell history and process listings can expose arguments.
+Each transfer derives an encryption key using **Argon2id with a fresh 16-byte
+salt**, carried with authenticated encrypted metadata. Receivers reject old
+plaintext metadata. The new CLI wire handshake is not compatible with older
+CLI builds (the library's legacy derivation remains deprecated for migration).
+
 ```bash
-./badsharing recv -listen :9099 -out /tmp/received_file.bin -key "my-secret-key"
+export BADSHARING_PASSPHRASE="replace-with-a-long-random-secret"
+./badsharing recv -listen :9099 -out /tmp/received_file.bin
 ```
 
 ### Start Sender with 25% Simulated Packet Loss
 
 ```bash
-./badsharing send -file my_file.bin -addr 127.0.0.1:9099 -loss 0.25 -redundancy 0.40 -key "my-secret-key"
+./badsharing send -file my_file.bin -addr 127.0.0.1:9099 -loss 0.25 -redundancy 0.40
 ```
 
 The receiver will output:
 ```text
 File successfully received and 100% verified against SHA-256!
 ```
+
+---
+
+## Optional UDP Peer Discovery & Mesh
+
+`PeerMesh` offers authenticated, best-effort UDP peer introductions and frame
+fan-out. A reachable peer can act as a bootstrap for others (no central file
+storage or mandatory tracker). Each participant uses the **same strong shared
+secret** for HMAC discovery messages. Only observed, authenticated peers are
+listed by `Peers()`. The mesh does **not** automatically distribute files,
+schedule RLNC generations, manage congestion, or guarantee NAT traversal.
+
+```go
+conn, err := net.ListenPacket("udp4", ":9000")
+if err != nil { panic(err) }
+defer conn.Close()
+
+mesh, err := badsharing.NewPeerMesh(conn, sharedKey) // [32]byte
+if err != nil { panic(err) }
+
+ctx, cancel := context.WithCancel(context.Background())
+defer cancel()
+
+go mesh.Maintain(ctx, []string{"203.0.113.10:9000"}) // reachable bootstrap example
+err = mesh.Serve(ctx, func(frame []byte, from net.Addr) {
+    // Pass frames to Receiver.IngestFrame for the corresponding file session.
+})
+// Call mesh.BroadcastFrame(senderFrame) to fan out an already sealed frame.
+```
+
+`Serve` owns reads from its UDP socket; use a dedicated UDP socket or route all
+mesh traffic through it. When peers meet through a reachable bootstrap, it
+exchanges candidate endpoints and triggers **reciprocal UDP probes**. This works
+for some NAT configurations; restrictive/symmetric NATs may require ICE/STUN
+and a TURN relay, which are **not included**.
+
+## Key Derivation
+
+For library clients, prefer `GenerateRandomKey()`. If a human passphrase is
+needed, use `GeneratePassphraseSalt()` for **every new transfer** and then
+`DeriveKeyFromPassphraseWithSalt(passphrase, salt)` on both sides. Include the
+public salt in an authenticated transfer handshake; never reuse a fixed salt.
+`DeriveKeyFromPassphrase(passphrase)` is deprecated and retained only for
+legacy integrations (fixed-salt PBKDF2), **not** for new transfers.
 
 ---
 
