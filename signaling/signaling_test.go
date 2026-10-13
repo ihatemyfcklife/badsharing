@@ -3,6 +3,7 @@ package signaling
 import (
 	"context"
 	"net/http/httptest"
+	"net/http"
 	"strings"
 	"sync"
 	"testing"
@@ -50,4 +51,20 @@ func TestConcurrentSignalingRequests(t *testing.T) {
 		}()
 	}
 	wg.Wait()
+}
+
+func TestCORSRequiresExplicitOrigin(t *testing.T) {
+	token:=strings.Repeat("z",48)
+	broker,_:=NewServer(token)
+	if err:=broker.AllowOrigin("https://ihatemyfcklife.github.io");err!=nil {t.Fatal(err)}
+	for _,tc:=range []struct{origin string;status int}{
+		{"https://ihatemyfcklife.github.io",http.StatusNoContent},
+		{"https://untrusted.example",http.StatusForbidden},
+	} {
+		request:=httptest.NewRequest(http.MethodOptions,"/v1/signal?room=room&peer=peer",nil)
+		request.Header.Set("Origin",tc.origin)
+		w:=httptest.NewRecorder()
+		broker.ServeHTTP(w,request)
+		if w.Code!=tc.status {t.Fatalf("%s returned %d, wanted %d",tc.origin,w.Code,tc.status)}
+	}
 }
