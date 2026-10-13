@@ -17,7 +17,8 @@ import (
 const (
 	maxPeersPerRoom=128
 	maxRooms=256
-	maxQueue=64
+	maxQueue=16
+	maxQueuedBytes=8<<20
 	maxMessage=65536
 	peerTTL=5*time.Minute
 )
@@ -40,6 +41,7 @@ type Server struct {
 	mu sync.Mutex
 	token string
 	rooms map[string]map[string]*inbox
+	queuedBytes int
 }
 
 // NewServer requires a random, private bearer token. Run it only behind HTTPS
@@ -71,7 +73,10 @@ func (s *Server) authorize(w http.ResponseWriter,r *http.Request) bool {
 func (s *Server) cleanLocked(now time.Time) {
 	for room,peers:=range s.rooms {
 		for id,p:=range peers {
-			if now.Sub(p.last)>peerTTL {delete(peers,id)}
+			if now.Sub(p.last)>peerTTL {
+				for _,item:=range p.pending {s.queuedBytes-=len(item.Data)}
+				delete(peers,id)
+			}
 		}
 		if len(peers)==0 {delete(s.rooms,room)}
 	}
@@ -132,6 +137,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter,r *http.Request) {
 	}
 	if r.Method==http.MethodGet {
 		queue:=s.rooms[room][id].pending
+		for _,item:=range queue {s.queuedBytes-=len(item.Data)}
 		s.rooms[room][id].pending=nil
 		if queue==nil {queue=[]Message{}}
 		_ = json.NewEncoder(w).Encode(queue)
@@ -145,9 +151,10 @@ func (s *Server) ServeHTTP(w http.ResponseWriter,r *http.Request) {
 	if target==nil {
 		http.Error(w,"unknown peer",http.StatusNotFound);return
 	}
-	if len(target.pending)>=maxQueue {
+	if len(target.pending)>=maxQueue||s.queuedBytes+len(msg.Data)>maxQueuedBytes {
 		http.Error(w,"receiver queue full",http.StatusTooManyRequests);return
 	}
 	target.pending=append(target.pending,msg)
+	s.queuedBytes+=len(msg.Data)
 	w.WriteHeader(http.StatusAccepted)
 }
