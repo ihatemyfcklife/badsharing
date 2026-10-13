@@ -8,11 +8,33 @@ import (
 	"io"
 
 	"github.com/ihatemyfcklife/badcrypt"
+	"golang.org/x/crypto/argon2"
 	"golang.org/x/crypto/pbkdf2"
 )
 
-// kdfSalt is the cryptographic domain separation salt for PBKDF2 key stretching.
-var kdfSalt = []byte("badsharing-passphrase-salt-v1")
+// legacyKDFSalt is retained only to decode sessions created by older applications.
+// Deprecated: never use the legacy fixed-salt derivation for new sessions.
+var legacyKDFSalt = []byte("badsharing-passphrase-salt-v1")
+
+// PassphraseSaltSize is the required random per-transfer salt size.
+const PassphraseSaltSize = 16
+
+// GeneratePassphraseSalt returns a fresh cryptographically random salt.
+// The salt is public and must accompany the encrypted transfer metadata.
+func GeneratePassphraseSalt() ([PassphraseSaltSize]byte, error) {
+	var salt [PassphraseSaltSize]byte
+	_, err := io.ReadFull(rand.Reader, salt[:])
+	return salt, err
+}
+
+// DeriveKeyFromPassphraseWithSalt uses Argon2id with a unique per-transfer salt.
+// The passphrase must be supplied independently; salts need not be secret.
+func DeriveKeyFromPassphraseWithSalt(passphrase string, salt [PassphraseSaltSize]byte) [32]byte {
+	var key [32]byte
+	derived := argon2.IDKey([]byte(passphrase), salt[:], 3, 64*1024, 4, 32)
+	copy(key[:], derived)
+	return key
+}
 
 const (
 	// DefaultWindowSize is the default sliding window convolution depth in badrlnc.
@@ -40,11 +62,11 @@ func GenerateRandomKey() ([32]byte, error) {
 	return key, nil
 }
 
-// DeriveKeyFromPassphrase derives a 32-byte session key from a user passphrase using
-// PBKDF2 with 100,000 iterations of HMAC-SHA256, protecting against GPU dictionary attacks.
+// DeriveKeyFromPassphrase is provided only for backward compatibility with v1 clients.
+// Deprecated: uses a fixed salt; use DeriveKeyFromPassphraseWithSalt and GeneratePassphraseSalt.
 func DeriveKeyFromPassphrase(passphrase string) [32]byte {
 	var key [32]byte
-	derived := pbkdf2.Key([]byte(passphrase), kdfSalt, 100_000, 32, sha256.New)
+	derived := pbkdf2.Key([]byte(passphrase), legacyKDFSalt, 100_000, 32, sha256.New)
 	copy(key[:], derived)
 	return key
 }

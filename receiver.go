@@ -39,6 +39,7 @@ type Receiver struct {
 	bytesWritten  uint64
 	chunksDecoded uint64
 	completed     bool
+	writeErr      error
 
 	statsMu        sync.Mutex
 	framesReceived uint64
@@ -106,7 +107,7 @@ func (r *Receiver) onPacketInOrder(seq uint64, packet []byte) {
 	r.writeMu.Lock()
 	defer r.writeMu.Unlock()
 
-	if r.completed {
+	if r.completed || r.writeErr != nil {
 		return
 	}
 
@@ -118,10 +119,24 @@ func (r *Receiver) onPacketInOrder(seq uint64, packet []byte) {
 	}
 
 	if toWrite > 0 {
-		n, _ := r.writer.Write(packet[:toWrite])
-		r.hasher.Write(packet[:toWrite])
-		r.bytesWritten += uint64(n)
-		r.chunksDecoded++
+		n, err := r.writer.Write(packet[:toWrite])
+		if n < 0 || n > toWrite {
+			r.writeErr = errors.New("badsharing: writer returned invalid byte count")
+			return
+		}
+		if n > 0 {
+			_, _ = r.hasher.Write(packet[:n])
+			r.bytesWritten += uint64(n)
+			r.chunksDecoded++
+		}
+		if err != nil {
+			r.writeErr = fmt.Errorf("badsharing: writing output: %w", err)
+			return
+		}
+		if n != toWrite {
+			r.writeErr = fmt.Errorf("badsharing: writing output: %w", io.ErrShortWrite)
+			return
+		}
 	}
 
 	if r.bytesWritten >= r.meta.Size {
@@ -192,9 +207,12 @@ func (r *Receiver) IngestFrame(wireFrame []byte) (bool, error) {
 	}
 
 	r.writeMu.Lock()
-	done := r.completed
+	done, writeErr := r.completed, r.writeErr
 	r.writeMu.Unlock()
 
+	if writeErr != nil {
+		return false, writeErr
+	}
 	return done, nil
 }
 
@@ -244,6 +262,9 @@ func (r *Receiver) Close() error {
 	r.writeMu.Lock()
 	defer r.writeMu.Unlock()
 
+	if r.writeErr != nil {
+		return r.writeErr
+	}
 	if r.bytesWritten < r.meta.Size {
 		return fmt.Errorf("badsharing: incomplete transfer: received %d of %d bytes",
 			r.bytesWritten, r.meta.Size)

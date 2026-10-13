@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/binary"
+	"errors"
 	"io"
 	mrand "math/rand/v2"
 	"sync"
@@ -837,4 +838,58 @@ func TestFileTransfer_MultiGeneration_500KB(t *testing.T) {
 	dSent, pSent := sender.Stats()
 	t.Logf("Multi-generation 500KB Transfer Passed: Total=%d (Data=%d, Parity=%d), Dropped=%d, Bit-Exact 100%%",
 		totalFrames, dSent, pSent, droppedFrames)
+}
+
+type brokenOutputWriter struct {
+	n int
+	err error
+}
+
+func (w brokenOutputWriter) Write(p []byte) (int, error) {
+	return w.n, w.err
+}
+
+func TestReceiverOutputWriteErrors(t *testing.T) {
+	data := []byte("receiver must not silently accept broken disk writes")
+	meta, err := NewFileMetadata("test.txt", bytes.NewReader(data))
+	if err != nil {
+		t.Fatal(err)
+	}
+	key, err := GenerateRandomKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := SessionConfig{SessionID: meta.SessionID, SharedKey: key}
+	testErr := errors.New("disk full")
+	for _, tc := range []struct {
+		name string
+		writer io.Writer
+		want error
+	}{
+		{"disk-full", brokenOutputWriter{n: 0, err: testErr}, testErr},
+		{"partial-write-with-error", brokenOutputWriter{n: 4, err: testErr}, testErr},
+		{"silent-short-write", brokenOutputWriter{n: 4}, io.ErrShortWrite},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			sender, err := NewSender(meta, bytes.NewReader(data), cfg)
+			if err != nil {
+				t.Fatal(err)
+			}
+			receiver, err := NewReceiver(meta, tc.writer, cfg)
+			if err != nil {
+				t.Fatal(err)
+			}
+			frame, eof, err := sender.NextFrame()
+			if err != nil || eof {
+				t.Fatalf("NextFrame: eof=%v err=%v", eof, err)
+			}
+			_, err = receiver.IngestFrame(frame)
+			if !errors.Is(err, tc.want) {
+				t.Fatalf("IngestFrame error = %v, want %v", err, tc.want)
+			}
+			if err := receiver.Close(); !errors.Is(err, tc.want) {
+				t.Fatalf("Close error = %v, want %v", err, tc.want)
+			}
+		})
+	}
 }
