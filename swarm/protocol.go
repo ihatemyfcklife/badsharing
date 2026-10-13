@@ -11,6 +11,7 @@ import (
 	"io"
 	"sort"
 	"sync"
+	"time"
 
 	"github.com/ihatemyfcklife/badsharing"
 	"github.com/ihatemyfcklife/badcrypt"
@@ -60,8 +61,10 @@ func unpack(data []byte) (kind byte, gen uint64, payload []byte, err error) {
 	gen = binary.BigEndian.Uint64(data[5:13])
 	payload = data[wireHeader:]
 	switch kind {
-	case wireWant, wireDone:
-		if len(payload) != 0 { return 0, 0, nil, errors.New("swarm: unexpected control payload") }
+	case wireWant:
+		if len(payload)!=0 && len(payload)!=2 {return 0,0,nil,errors.New("swarm: invalid want payload")}
+	case wireDone:
+		if len(payload)!=0 {return 0,0,nil,errors.New("swarm: unexpected control payload")}
 	case wireShard:
 		if len(payload) != badcrypt.ConstantWireFrameSize {
 			return 0, 0, nil, badsharing.ErrInvalidFrameSize
@@ -81,6 +84,8 @@ type Source struct {
 	// Have may restrict which generations this source is allowed to seed.
 	Have map[uint64]bool
 	Redundancy float64
+	// RateLimitBytesPerSecond paces each source connection; zero disables it.
+	RateLimitBytesPerSecond int64
 }
 
 func (s *Source) Serve(ctx context.Context, link Link) error {
@@ -93,7 +98,7 @@ func (s *Source) Serve(ctx context.Context, link Link) error {
 	for {
 		packet, err := link.Recv(ctx)
 		if err != nil { if ctx.Err() != nil { return nil }; return err }
-		kind, gen, _, err := unpack(packet)
+		kind, gen, requested, err := unpack(packet)
 		if err != nil { return err }
 		if kind != wireWant { return errors.New("swarm: source expected generation request") }
 		total := s.Manifest.Metadata.TotalGenerations()
@@ -103,13 +108,32 @@ func (s *Source) Serve(ctx context.Context, link Link) error {
 			if err := link.Send(ctx, pack(wireDone, gen, nil)); err != nil {return err}
 			continue
 		}
-		sender, err := badsharing.NewGenerationSender(s.Manifest, s.Reader, s.Key, gen, s.Redundancy)
+		ratio:=s.Redundancy
+		if len(requested)==2 {
+			ratio=float64(binary.BigEndian.Uint16(requested))/1000
+		}
+		if ratio<0.25 {ratio=0.25}
+		if ratio>2 {ratio=2}
+		sender, err := badsharing.NewGenerationSender(s.Manifest, s.Reader, s.Key, gen, ratio)
 		if err != nil { return err }
+		var sentBytes int64
+		started:=time.Now()
 		for {
 			frame, eof, err := sender.NextFrame()
 			if err != nil {return err}
 			if eof {break}
 			if err := link.Send(ctx, pack(wireShard, gen, frame)); err != nil {return err}
+			if s.RateLimitBytesPerSecond>0 {
+				sentBytes+=int64(len(frame))
+				pause:=time.Duration(float64(sentBytes)/float64(s.RateLimitBytesPerSecond)*float64(time.Second))-time.Since(started)
+				if pause>0 {
+					timer:=time.NewTimer(pause)
+					select {
+					case <-ctx.Done():if !timer.Stop(){<-timer.C};return ctx.Err()
+					case <-timer.C:
+					}
+				}
+			}
 		}
 		if err := link.Send(ctx, pack(wireDone, gen, nil)); err != nil {return err}
 	}
