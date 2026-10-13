@@ -82,7 +82,7 @@ jobs:
           fi
 
           # Find the latest tag
-          LATEST_TAG=$(git tag -l "v[0-9]*.[0-9]*.[0-9]*" | sort -V | tail -n1)
+          LATEST_TAG=$(git tag -l "v1.[0-9]*.[0-9]*" | sort -V | tail -n1)
           if [ -z "$LATEST_TAG" ]; then
             NEW_TAG="v1.0.0"
             echo "No existing tags found. Initializing release at $NEW_TAG"
@@ -135,6 +135,7 @@ jobs:
           echo "Creating GitHub Release for $TAG..."
           gh release create "$TAG" \
             --title "Release $TAG" \
+            --latest \
             --generate-notes
 
       - name: Warm up Go Proxy & pkg.go.dev
