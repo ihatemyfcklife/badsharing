@@ -47,6 +47,9 @@ type Link struct {
 	pc *webrtc.PeerConnection
 	mu sync.Mutex
 	channel *webrtc.DataChannel
+	control *webrtc.DataChannel
+	dataOpen bool
+	controlOpen bool
 	received chan []byte
 	ready chan struct{}
 	closed chan struct{}
@@ -64,6 +67,9 @@ func New(ice ICEConfig,initiator bool) (*Link,error) {
 	})
 	pc.OnDataChannel(func(dc *webrtc.DataChannel){p.attach(dc)})
 	if initiator {
+		control,err:=pc.CreateDataChannel("badsharing-control",nil)
+		if err!=nil {_=pc.Close();return nil,err}
+		p.attach(control)
 		ordered:=false
 		retransmits:=uint16(0)
 		dc,err:=pc.CreateDataChannel("badsharing-rlnc",&webrtc.DataChannelInit{
@@ -75,14 +81,23 @@ func New(ice ICEConfig,initiator bool) (*Link,error) {
 	return p,nil
 }
 func (p *Link) attach(dc *webrtc.DataChannel) {
-	if dc.Label()!="badsharing-rlnc" {_=dc.Close();return}
+	if dc.Label()!="badsharing-rlnc"&&dc.Label()!="badsharing-control" {_=dc.Close();return}
 	p.mu.Lock()
-	if p.channel!=nil&&p.channel!=dc {
-		p.mu.Unlock();_ =dc.Close();return
+	if dc.Label()=="badsharing-control" {
+		if p.control!=nil&&p.control!=dc {p.mu.Unlock();_=dc.Close();return}
+		p.control=dc
+	} else {
+		if p.channel!=nil&&p.channel!=dc {p.mu.Unlock();_=dc.Close();return}
+		p.channel=dc
 	}
-	p.channel=dc
 	p.mu.Unlock()
-	dc.OnOpen(func(){p.readyOnce.Do(func(){close(p.ready)})})
+	dc.OnOpen(func(){
+		p.mu.Lock()
+		if dc.Label()=="badsharing-control" {p.controlOpen=true} else {p.dataOpen=true}
+		both:=p.controlOpen&&p.dataOpen
+		p.mu.Unlock()
+		if both {p.readyOnce.Do(func(){close(p.ready)})}
+	})
 	dc.OnMessage(func(msg webrtc.DataChannelMessage){
 		if !msg.IsString&&len(msg.Data)>0&&len(msg.Data)<=8192 {
 			payload:=append([]byte(nil),msg.Data...)
@@ -130,7 +145,8 @@ func (p *Link) Send(ctx context.Context,data []byte) error {
 	if err:=p.WaitReady(ctx);err!=nil{return err}
 	for {
 		p.mu.Lock()
-		ch:=p.channel
+		ch:=p.control
+		if len(data)>=5&&string(data[:4])=="BSW1"&&data[4]==2 {ch=p.channel}
 		if ch==nil {p.mu.Unlock();return errors.New("webrtc: data channel missing")}
 		if ch.BufferedAmount()<maxBufferedAmount {
 			err:=ch.Send(data)
