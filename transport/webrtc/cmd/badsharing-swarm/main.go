@@ -8,6 +8,7 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
+	"errors"
 	"flag"
 	"fmt"
 	"log"
@@ -129,6 +130,9 @@ ready:
 	manifest:=got[0].manifest
 	name:=*output
 	if name=="" {name=manifest.Metadata.Name}
+	if _,err:=os.Stat(name);err==nil {
+		log.Fatalf("destination %q already exists; choose a new -out path",name)
+	} else if !errors.Is(err,os.ErrNotExist) {log.Fatal(err)}
 	partial:=name+".part"
 	out,err:=os.OpenFile(partial,os.O_RDWR|os.O_CREATE,0600)
 	if err!=nil {log.Fatal(err)}
