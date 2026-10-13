@@ -112,6 +112,7 @@ func (s *Source) Serve(ctx context.Context, link Link) error {
 		if len(requested)==2 {
 			ratio=float64(binary.BigEndian.Uint16(requested))/1000
 		}
+		if ratio<s.Redundancy {ratio=s.Redundancy}
 		if ratio<0.25 {ratio=0.25}
 		if ratio>2 {ratio=2}
 		sender, err := badsharing.NewGenerationSender(s.Manifest, s.Reader, s.Key, gen, ratio)
