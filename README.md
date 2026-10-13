@@ -42,7 +42,7 @@ Furthermore, running raw Random Linear Network Coding (RLNC) over untrusted dece
 
 `badsharing` solves both problems:
 - **Zero-Coordination Swarms**: Powered by `badrlnc`, shards represent random linear combinations over $\text{GF}(2)$. Every incoming innovative shard provides useful mathematical entropy ($+1$ degree of freedom).
-- **Cryptographic Pollution Immunity**: Powered by `badcrypt`, every shard is encapsulated within an authenticated 1380-byte wire frame (`SealFrame` / `OpenFrame`). Any tampered or injected frame is rejected in $O(1)$ by Poly1305 authentication before it can reach the Gauss-Jordan solver.
+- **Cryptographic Pollution Immunity**: Powered by `badcrypt`, every shard is encapsulated within an authenticated 1380-byte wire frame (`SealFrame` / `OpenFrame`). Frames without a valid MAC are rejected before decoding. Peers who possess the shared group key are trusted and can still introduce malicious coded shards; group authentication is not peer-by-peer authorization.
 - **Microsecond In-Memory Recovery**: Lost packets are reconstructed on-the-fly in under $1\ \mu\text{s}$ without retransmission delays (0 RTT).
 
 ---
@@ -142,7 +142,7 @@ func main() {
 	var key [32]byte
 	copy(key[:], keyBytes)
 	cfg := badsharing.SessionConfig{
-		SessionID:       badsharing.GenerateSessionID(),
+		SessionID:       meta.SessionID,
 		SharedKey:       key,
 		WindowSize:      32,
 		RedundancyRatio: 0.30, // 30% parity redundancy
@@ -174,6 +174,7 @@ func main() {
 package main
 
 import (
+	"encoding/hex"
 	"os"
 
 	"github.com/ihatemyfcklife/badsharing"
