@@ -459,6 +459,17 @@ SHA-256 is checked before completion.
 
 ### Browser integration
 
+For cross-origin browser use (e.g., an app served from GitHub Pages),
+configure a single trusted origin on the signaling server:
+
+```bash
+export BADSHARING_SIGNAL_ORIGINS="https://ihatemyfcklife.github.io"
+```
+
+The broker rejects unlisted cross-origin requests, and browsers still require
+a usable HTTPS endpoint and their own authenticated secret. Same-origin
+deployments do not require CORS configuration.
+
 A JavaScript transport/room adapter is available at
 [`transport/webrtc/browser/peer.js`](transport/webrtc/browser/peer.js).
 It connects a browser to Go/native Pion peers using compatible WebRTC
