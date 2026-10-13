@@ -69,6 +69,7 @@ func TestSwarmConcurrentSourcesAndResume(t *testing.T) {
 	received:=make([]byte,len(payload))
 	if n,err:=partial.ReadAt(received,0);err!=nil||n!=len(payload) {t.Fatalf("readback: %d, %v",n,err)}
 	if !bytes.Equal(payload,received) {t.Fatal("download corrupted")}
+	cancel()
 	for i:=0;i<2;i++ {
 		select {case <-workerErrors: case <-time.After(time.Second):t.Fatal("source goroutine leak")}
 	}
