@@ -102,6 +102,18 @@ func (s *Server) ServeHTTP(w http.ResponseWriter,r *http.Request) {
 	if r.URL.Path!="/v1/peers"&&r.URL.Path!="/v1/signal" {
 		http.NotFound(w,r);return
 	}
+	var incoming Message
+	if r.URL.Path=="/v1/signal"&&r.Method==http.MethodPost {
+		// Never hold the global room mutex while reading untrusted request bodies.
+		raw,err:=io.ReadAll(io.LimitReader(r.Body,maxMessage+1))
+		if err!=nil||len(raw)>maxMessage {
+			http.Error(w,"signal too large",http.StatusRequestEntityTooLarge);return
+		}
+		if json.Unmarshal(raw,&incoming)!=nil||incoming.From!=id||!validID(incoming.To)||incoming.To==id||
+			(incoming.Type!="offer"&&incoming.Type!="answer"&&incoming.Type!="ice")||len(incoming.Data)==0 {
+			http.Error(w,"invalid signal",http.StatusBadRequest);return
+		}
+	}
 	now:=time.Now()
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -128,16 +140,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter,r *http.Request) {
 	if r.Method!=http.MethodPost {
 		http.Error(w,"method not allowed",http.StatusMethodNotAllowed);return
 	}
-	// Read no more than maxMessage bytes, even from malicious peers.
-	raw,err:=io.ReadAll(io.LimitReader(r.Body,maxMessage+1))
-	if err!=nil||len(raw)>maxMessage {
-		http.Error(w,"signal too large",http.StatusRequestEntityTooLarge);return
-	}
-	var msg Message
-	if json.Unmarshal(raw,&msg)!=nil||msg.From!=id||!validID(msg.To)||msg.To==id||
-		(msg.Type!="offer"&&msg.Type!="answer"&&msg.Type!="ice") || len(msg.Data)==0 {
-		http.Error(w,"invalid signal",http.StatusBadRequest);return
-	}
+	msg:=incoming
 	target:=s.rooms[room][msg.To]
 	if target==nil {
 		http.Error(w,"unknown peer",http.StatusNotFound);return
