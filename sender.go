@@ -65,7 +65,7 @@ func NewSender(meta *FileMetadata, r io.Reader, cfg SessionConfig) (*Sender, err
 		SymbolSize: int(meta.ChunkSize),
 		Checksum:   true,
 		ZeroCopy:   false,
-		InitialSeq: 0,
+		InitialSeq: cfg.SequenceStart,
 	})
 
 	return &Sender{
