@@ -2,6 +2,7 @@ package swarm
 
 import (
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
@@ -124,7 +125,13 @@ func Download(ctx context.Context, manifest *badsharing.GenerationManifest, dest
 		defer scheduler.Release(p.ID)
 		sendCtx,stop:=context.WithTimeout(runCtx,5*time.Second)
 		defer stop()
-		if err:=p.Link.Send(sendCtx,pack(wireWant,gen,nil));err!=nil {return fmt.Errorf("swarm: asking %s for generation %d: %w",p.ID,gen,err)}
+		// Initial redundancy follows measured peer loss; retries increase
+		// available rank when previous coded shards were insufficient.
+		ratio:=0.35+2*p.Loss+0.2*float64(task.tries-1)
+		if ratio>2 {ratio=2}
+		var wanted [2]byte
+		binary.BigEndian.PutUint16(wanted[:],uint16(ratio*1000))
+		if err:=p.Link.Send(sendCtx,pack(wireWant,gen,wanted[:]));err!=nil {return fmt.Errorf("swarm: asking %s for generation %d: %w",p.ID,gen,err)}
 		stats.Requests++
 		return nil
 	}
