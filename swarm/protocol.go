@@ -121,6 +121,9 @@ type Scheduler struct {
 	mu sync.Mutex
 	peers []Peer
 	busy map[string]int
+	order []uint64
+	cursor int
+	queuedTotal uint64
 }
 func NewScheduler(peers []Peer) (*Scheduler, error) {
 	if len(peers) == 0 {return nil, errors.New("swarm: no peers")}
@@ -142,15 +145,25 @@ func (s *Scheduler) availability(gen uint64) int {
 // It returns false if no peer claims any of the remaining generations.
 func (s *Scheduler) NextGeneration(total uint64, completed, active map[uint64]bool) (uint64,bool) {
 	s.mu.Lock();defer s.mu.Unlock()
-	var choice uint64
-	best:=len(s.peers)+1
-	ok:=false
-	for g:=uint64(0);g<total;g++ {
-		if completed[g]||active[g] {continue}
-		available:=s.availability(g)
-		if available>0 && available<best {choice=g;best=available;ok=true}
+	if s.order==nil||s.queuedTotal!=total {
+		s.order=make([]uint64,0,total)
+		for g:=uint64(0);g<total;g++ {
+			if s.availability(g)>0 {s.order=append(s.order,g)}
+		}
+		sort.Slice(s.order,func(i,j int)bool{
+			a,b:=s.availability(s.order[i]),s.availability(s.order[j])
+			if a==b {return s.order[i]<s.order[j]}
+			return a<b
+		})
+		s.queuedTotal=total
+		s.cursor=0
 	}
-	return choice,ok
+	for s.cursor<len(s.order) {
+		g:=s.order[s.cursor]
+		s.cursor++
+		if !completed[g]&&!active[g] {return g,true}
+	}
+	return 0,false
 }
 func (s *Scheduler) Preferred(gen uint64, exclude map[string]bool) []Peer {
 	s.mu.Lock();defer s.mu.Unlock()
