@@ -43,6 +43,13 @@ jobs:
         run: |
           GOOS=js GOARCH=wasm go build ./...
 
+      - name: Verify optional Pion WebRTC module (native and browser)
+        run: |
+          cd transport/webrtc
+          go mod tidy
+          go test -race ./...
+          GOOS=js GOARCH=wasm go build ./...
+
   release:
     name: Tag & Publish Go Module
     needs: test
