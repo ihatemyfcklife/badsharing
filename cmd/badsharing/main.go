@@ -30,6 +30,22 @@ func main() {
 	}
 }
 
+const passphraseMetadataMagic = "BSHK"
+
+// The CLI deliberately has no default secret. Environment variables avoid
+// leaking passphrases into shell history and process command lines.
+func requirePassphrase(flagValue string) string {
+	if flagValue != "" {
+		return flagValue
+	}
+	if value := os.Getenv("BADSHARING_PASSPHRASE"); value != "" {
+		return value
+	}
+	fmt.Fprintln(os.Stderr, "Error: set BADSHARING_PASSPHRASE or provide -key (no default secret)")
+	os.Exit(2)
+	return ""
+}
+
 func printUsage() {
 	fmt.Println("Usage: badsharing <command> [arguments]")
 	fmt.Println("Commands:")
@@ -41,7 +57,7 @@ func runSend(args []string) {
 	fs := flag.NewFlagSet("send", flag.ExitOnError)
 	filePath := fs.String("file", "", "Path to the file to send (required)")
 	targetAddr := fs.String("addr", "127.0.0.1:9099", "Target UDP address (IP:port)")
-	passphrase := fs.String("key", "badsharing-default-secret", "Shared encryption passphrase")
+	passphrase := fs.String("key", "", "Shared passphrase (prefer BADSHARING_PASSPHRASE environment variable)")
 	redundancy := fs.Float64("redundancy", 0.30, "Parity redundancy ratio (e.g. 0.30 = 30% parity)")
 	simLoss := fs.Float64("loss", 0.0, "Simulated outbound packet drop ratio (0.0 - 0.50)")
 	_ = fs.Parse(args)
@@ -84,7 +100,13 @@ func runSend(args []string) {
 	}
 	defer conn.Close()
 
-	key := badsharing.DeriveKeyFromPassphrase(*passphrase)
+	secret := requirePassphrase(*passphrase)
+	salt, err := badsharing.GeneratePassphraseSalt()
+	if err != nil {
+		fmt.Printf("Error generating random salt: %v\n", err)
+		os.Exit(1)
+	}
+	key := badsharing.DeriveKeyFromPassphraseWithSalt(secret, salt)
 
 	cfg := badsharing.SessionConfig{
 		SessionID:       meta.SessionID,
@@ -110,8 +132,16 @@ func runSend(args []string) {
 		os.Exit(1)
 	}
 
+	// A public random salt accompanies each authenticated metadata packet.
+	metadataPacket := make([]byte, 0, len(passphraseMetadataMagic)+len(salt)+len(encMetaBytes))
+	metadataPacket = append(metadataPacket, passphraseMetadataMagic...)
+	metadataPacket = append(metadataPacket, salt[:]...)
+	metadataPacket = append(metadataPacket, encMetaBytes...)
 	for i := 0; i < 5; i++ {
-		_, _ = conn.Write(encMetaBytes)
+		if _, err := conn.Write(metadataPacket); err != nil {
+			fmt.Printf("Error sending metadata: %v\n", err)
+			os.Exit(1)
+		}
 		time.Sleep(10 * time.Millisecond)
 	}
 
@@ -181,9 +211,10 @@ func runRecv(args []string) {
 	buf := make([]byte, 2048)
 	var meta badsharing.FileMetadata
 
-	key := badsharing.DeriveKeyFromPassphrase(*passphrase)
+	secret := requirePassphrase(*passphrase)
+	var key [32]byte
 
-	// Step 1: Wait for metadata packet (authenticated encrypted or plaintext)
+	// Step 1: wait for per-transfer salt and authenticated encrypted metadata.
 	for {
 		n, _, err := conn.ReadFromUDP(buf)
 		if err != nil {
@@ -191,15 +222,13 @@ func runRecv(args []string) {
 			os.Exit(1)
 		}
 
-		if bytes.HasPrefix(buf[:n], badsharing.MagicEncryptedHeader[:]) {
-			if err := meta.UnmarshalEncrypted(buf[:n], key); err == nil {
+		if n >= 20 && bytes.HasPrefix(buf[:n], []byte(passphraseMetadataMagic)) {
+			var salt [badsharing.PassphraseSaltSize]byte
+			copy(salt[:], buf[4:20])
+			candidate := badsharing.DeriveKeyFromPassphraseWithSalt(secret, salt)
+			if err := meta.UnmarshalEncrypted(buf[20:n], candidate); err == nil {
+				key = candidate
 				fmt.Printf("Received authenticated encrypted metadata: %s (%d bytes, SHA256=%x, SessionID=%x)\n",
-					meta.Name, meta.Size, meta.Checksum, meta.SessionID)
-				break
-			}
-		} else if bytes.HasPrefix(buf[:n], badsharing.MagicHeader[:]) {
-			if err := meta.UnmarshalBinary(buf[:n]); err == nil {
-				fmt.Printf("Received metadata: %s (%d bytes, SHA256=%x, SessionID=%x)\n",
 					meta.Name, meta.Size, meta.Checksum, meta.SessionID)
 				break
 			}
@@ -246,7 +275,7 @@ func runRecv(args []string) {
 		_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
 
 		// Skip metadata packets
-		if bytes.HasPrefix(buf[:n], badsharing.MagicHeader[:]) || bytes.HasPrefix(buf[:n], badsharing.MagicEncryptedHeader[:]) {
+		if bytes.HasPrefix(buf[:n], []byte(passphraseMetadataMagic)) {
 			continue
 		}
 
