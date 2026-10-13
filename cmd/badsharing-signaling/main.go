@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/ihatemyfcklife/badsharing/signaling"
@@ -20,6 +21,12 @@ func main() {
 	token:=os.Getenv("BADSHARING_SIGNAL_TOKEN")
 	broker,err:=signaling.NewServer(token)
 	if err!=nil {log.Fatal(err)}
+	// Optional explicit browser origins, for example GitHub Pages deployment.
+	if value:=os.Getenv("BADSHARING_SIGNAL_ORIGINS");value!="" {
+		for _,origin:=range strings.Split(value,",") {
+			if err:=broker.AllowOrigin(strings.TrimSpace(origin));err!=nil {log.Fatal(err)}
+		}
+	}
 	host,_,err:=net.SplitHostPort(*addr)
 	if err!=nil {log.Fatal(err)}
 	ip:=net.ParseIP(host)
