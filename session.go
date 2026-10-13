@@ -51,6 +51,8 @@ type SessionConfig struct {
 	WindowSize      int
 	GenerationSize  int
 	RedundancyRatio float64
+	// SequenceStart is the absolute RLNC sequence number for a scoped sender.
+	SequenceStart uint64
 }
 
 // GenerateRandomKey creates a cryptographically secure 32-byte session secret.
