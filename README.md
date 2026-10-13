@@ -356,6 +356,137 @@ channel.onmessage = (event) => {
 };
 ```
 
+
+---
+
+## Automatic multi-peer swarms (new)
+
+The `swarm` package adds **authenticated per-generation manifests**, out-of-order
+GF(2) RLNC decoding from multiple independently encrypted senders, rarity-based
+scheduling, bounded retries, per-generation SHA-256 verification before disk
+writes, and crash-safe resume using re-hashing of previously downloaded
+generations. The library remains usable without WebRTC and without a server.
+
+`signaling` provides a bounded HTTP rendezvous service for ICE SDP exchange.
+Signaling nodes do not receive encrypted file shards; however, they can observe
+network metadata. Clients must use HTTPS away from localhost and authenticate
+with a strong bearer token. This broker is a bootstrap service, **not a trackerless
+DHT**. It is suitable for small private swarms, not an internet-wide directory.
+
+The optional **Pion WebRTC** transport lives in a separate Go module under
+`transport/webrtc/`, keeping the core Go module lean. It supports ICE,
+STUN and TURN, with a reliable ordered control DataChannel (manifest and requests)
+and an unordered, retransmission-disabled DataChannel for RLNC frames.
+Use TURN credentials from a trusted deployment. A TURN relay may carry encrypted
+traffic when direct peer connectivity fails; this is still encrypted end-to-end
+at the badcrypt layer.
+
+### Quickstart: two terminals over WebRTC
+
+You need Go 1.24+ (a newer toolchain may be downloaded for Pion),
+a reachable signaling server and a strong *independently shared* pair
+of secrets. Generate both once, and set the same values on sender and receiver:
+
+```bash
+export BADSHARING_SIGNAL_TOKEN="$(openssl rand -hex 32)"
+export BADSHARING_KEY_HEX="$(openssl rand -hex 32)"
+```
+
+Use the **same** environment values in the receiver terminal; don't rerun
+the generator there. Distribute secrets via a secure channel, not through
+the signaling service. The token limits rendezvous access; the random
+`BADSHARING_KEY_HEX` authenticates manifest and encrypted data.
+
+Start a rendezvous server on the same machine:
+
+```bash
+go run ./cmd/badsharing-signaling -listen 127.0.0.1:8088
+```
+
+For a public rendezvous, configure TLS and a public hostname; the server refuses
+to listen on a public address without `-tls-cert` and `-tls-key`.
+On an actual internet deployment, `-signal` must use HTTPS.
+
+Then start the sender (from inside the optional module):
+
+```bash
+cd transport/webrtc
+go mod tidy
+go run ./cmd/badsharing-swarm -mode send -room my-private-room -file /path/to/file.zip
+```
+
+In the receiver terminal, run from that same `transport/webrtc` directory:
+
+```bash
+go run ./cmd/badsharing-swarm -mode recv -room my-private-room -out received.zip
+```
+
+For **multi-source** download, run multiple `-mode send` peers hosting
+identical content and sharing the exact same authenticated manifest, then
+start `-mode recv -sources 2`. All participants need the same transfer
+key and room. The receiver writes to `received.zip.part`, verifies
+each generation, and atomically renames the finished file. Running again
+with the same filename re-verifies partial generations and resumes missing ones.
+
+For NAT traversal, add STUN and, when necessary, TURN to **both** clients:
+
+```bash
+export BADSHARING_TURN_USER="temporary-turn-user"
+export BADSHARING_TURN_PASSWORD="temporary-turn-password"
+go run ./cmd/badsharing-swarm -mode recv -room my-private-room \
+  -stun stun:stun.l.google.com:19302 \
+  -turn turn:turn.example.net:3478 -relay-only
+```
+
+Use your **own TURN endpoint**, valid short-lived credentials and a TLS
+signaling endpoint for deployment. ICE chooses direct connections when
+possible; `-relay-only` forces the TURN path for testing and restricted
+networks. ICE does not guarantee a working path without suitable servers.
+
+### Go API
+
+`BuildGenerationManifest`, `NewGenerationSender`,
+`NewGenerationReceiver`, `swarm.Source.Serve`, and `swarm.Download`
+are composable independent of WebRTC. The `swarm.Link` interface only needs
+`Send(ctx, payload)`, `Recv(ctx)` and `Close()`. The transport layer
+must authenticate peers; a shared swarm key is a group secret, not a
+per-peer identity.
+
+Each generation sender uses a **fresh random badcrypt SessionID** to avoid
+reusing ChaCha20-Poly1305 nonces. Metadata uses an HMAC plus per-generation
+digests to prevent silently committing polluted data to disk. File-level
+SHA-256 is checked before completion.
+
+### Browser integration
+
+A JavaScript transport/room adapter is available at
+[`transport/webrtc/browser/peer.js`](transport/webrtc/browser/peer.js).
+It connects a browser to Go/native Pion peers using compatible WebRTC
+DataChannels and forwards binary messages to an application-supplied
+`onPacket(peerID, bytes)` callback. Use a separate Go/WASM instance to
+process those bytes through badcrypt/badrlnc. The browser adapter **is not
+a full graphical upload/download application**; an application must still
+wire its WASM engine, session key management and UI. Pion itself also offers
+a `GOOS=js GOARCH=wasm` build, verified in CI.
+
+### Operational limits and threats
+
+- Only 64 source chunks per generation; verification prevents writing bad
+  generations, but a malicious peer possessing the shared group key can
+  disrupt a generation or cause retransmission.
+- Resume re-hashes existing generation bytes; it never trusts a progress
+  counter alone.
+- Multi-peer scheduling uses static availability lists supplied at connection
+  time (nil means full seed). Dynamic gossip inventories, a global DHT,
+  bandwidth throttling, and congestion-aware fair queues across swarms
+  remain future improvements.
+- Large swarms require TURN bandwidth budgeting and active DoS defenses for
+  the rendezvous server. Do not expose the broker publicly without TLS,
+  rate limits, monitoring, and rotating private bearer tokens.
+- The independent WebRTC module uses a local `replace` to compile against the
+  checkout of this repository. For a published standalone transport SDK,
+  migrate to a released Go module version and remove that replace.
+
 ---
 
 ## Testing & Validation
