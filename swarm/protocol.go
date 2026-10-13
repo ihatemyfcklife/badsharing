@@ -4,6 +4,7 @@ package swarm
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -188,13 +189,13 @@ func VerifyExisting(m *badsharing.GenerationManifest, r io.ReaderAt, key [32]byt
 	return done,nil
 }
 func hashChunk(payload []byte) [32]byte {
-	return sha256sum(payload)
+	return sha256.Sum256(payload)
 }
 
 // Verifies the complete file at the end of the download when a reader is provided.
 func VerifyFile(m *badsharing.GenerationManifest, r io.ReaderAt) error {
 	if m==nil||r==nil {return errors.New("swarm: missing verify reader")}
-	h:=sha256New()
+	h:=sha256.New()
 	if _,err:=io.Copy(h,io.NewSectionReader(r,0,int64(m.Metadata.Size)));err!=nil{return err}
 	var sum [32]byte;copy(sum[:],h.Sum(nil))
 	if sum!=m.Metadata.Checksum {return fmt.Errorf("swarm: reconstructed file checksum mismatch")}
