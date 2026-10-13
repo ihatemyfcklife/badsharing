@@ -8,6 +8,7 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"net/url"
 	"sort"
 	"strings"
 	"sync"
@@ -42,13 +43,32 @@ type Server struct {
 	token string
 	rooms map[string]map[string]*inbox
 	queuedBytes int
+	allowedOrigins map[string]bool
 }
 
 // NewServer requires a random, private bearer token. Run it only behind HTTPS
 // in production; both SDP and bearer tokens must be protected in transit.
 func NewServer(token string) (*Server,error) {
 	if len(token)<32 {return nil,errors.New("signaling: require a strong >=32-character token")}
-	return &Server{token:token,rooms:make(map[string]map[string]*inbox)},nil
+	return &Server{token:token,rooms:make(map[string]map[string]*inbox),allowedOrigins:make(map[string]bool)},nil
+}
+
+// AllowOrigin adds a single trusted browser origin for credentialed signaling.
+// Call during startup, before serving requests. Wildcards are not allowed.
+func (s *Server) AllowOrigin(origin string) error {
+	u,err:=url.Parse(origin)
+	if err!=nil||u.Host==""||u.User!=nil||u.Path!=""||u.RawQuery!=""||u.Fragment!="" {
+		return errors.New("signaling: origin must be a scheme and host only")
+	}
+	if u.Scheme!="https" {
+		if u.Scheme!="http" || (u.Hostname()!="localhost"&&u.Hostname()!="127.0.0.1") {
+			return errors.New("signaling: only HTTPS origins or loopback HTTP are allowed")
+		}
+	}
+	s.mu.Lock()
+	s.allowedOrigins[origin]=true
+	s.mu.Unlock()
+	return nil
 }
 
 func validID(s string) bool {
@@ -98,6 +118,27 @@ func (s *Server) registerLocked(room,id string,now time.Time) error {
 func (s *Server) ServeHTTP(w http.ResponseWriter,r *http.Request) {
 	w.Header().Set("Cache-Control","no-store")
 	w.Header().Set("X-Content-Type-Options","nosniff")
+	if origin:=r.Header.Get("Origin");origin!="" {
+		s.mu.Lock()
+		allowed:=s.allowedOrigins[origin]
+		s.mu.Unlock()
+		parsed,err:=url.Parse(origin)
+		if err!=nil {http.Error(w,"invalid origin",http.StatusForbidden);return}
+		if !allowed && !strings.EqualFold(parsed.Host,r.Host) {
+			http.Error(w,"origin not permitted",http.StatusForbidden);return
+		}
+		if allowed {
+			w.Header().Set("Access-Control-Allow-Origin",origin)
+			w.Header().Set("Vary","Origin")
+			w.Header().Set("Access-Control-Allow-Methods","GET, POST, OPTIONS")
+			w.Header().Set("Access-Control-Allow-Headers","Authorization, Content-Type")
+		}
+	}
+	if r.Method==http.MethodOptions {
+		if r.Header.Get("Origin")=="" {http.Error(w,"missing origin",http.StatusBadRequest);return}
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
 	if !s.authorize(w,r){return}
 	room:=r.URL.Query().Get("room")
 	id:=r.URL.Query().Get("peer")
