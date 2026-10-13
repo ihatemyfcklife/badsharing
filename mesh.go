@@ -50,7 +50,9 @@ func NewPeerMesh(conn net.PacketConn, key [32]byte) (*PeerMesh, error) {
 	if key == ([32]byte{}) {
 		return nil, errors.New("badsharing: peer mesh requires a non-zero shared key")
 	}
-	return &PeerMesh{conn: conn, key: key, peers: make(map[string]time.Time), seen: make(map[[32]byte]time.Time)}, nil
+	// Domain-separate the control-plane MAC key from data-plane AEAD keys.
+	controlKey := sha256.Sum256(append([]byte("badsharing-peer-control-v1:"), key[:]...))
+	return &PeerMesh{conn: conn, key: controlKey, peers: make(map[string]time.Time), seen: make(map[[32]byte]time.Time)}, nil
 }
 
 func validPeerAddr(s string) bool {
